@@ -40,6 +40,8 @@ export const createSession = (sessionId: string, mode: RoutingMode): VoiceSessio
 /** The label shown next to the microphone for every voice state. */
 export const VOICE_STATE_LABELS: Record<VoiceState, string> = {
   idle: "Ready",
+  recording: "Recording...",
+  uploading: "Uploading audio...",
   listening: "Listening...",
   transcribing: "Transcribing...",
   routing: "Selecting agent...",

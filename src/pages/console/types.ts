@@ -30,6 +30,8 @@ export type RoutingMode = "hal" | "auto" | "tron";
 /** Single frontend voice state that drives the microphone area. */
 export type VoiceState =
   | "idle"
+  | "recording"
+  | "uploading"
   | "listening"
   | "transcribing"
   | "routing"
@@ -41,6 +43,11 @@ export type VoiceState =
 /** Voice failures the UI knows how to render. Frontend-only for now. */
 export type VoiceError =
   | "microphone-unavailable"
+  | "microphone-permission"
+  | "microphone-missing"
+  | "recording-unsupported"
+  | "recording-empty"
+  | "no-speech"
   | "transcription-failed"
   | "synthesis-failed"
   | "agent-unavailable"
@@ -49,6 +56,11 @@ export type VoiceError =
 
 export const VOICE_ERROR_LABELS: Record<VoiceError, string> = {
   "microphone-unavailable": "Microphone unavailable",
+  "microphone-permission": "Microphone permission denied",
+  "microphone-missing": "No microphone found",
+  "recording-unsupported": "Recording not supported",
+  "recording-empty": "Recording too short",
+  "no-speech": "No speech detected",
   "transcription-failed": "Transcription failed",
   "synthesis-failed": "Voice synthesis failed",
   "agent-unavailable": "Agent unavailable",
@@ -58,6 +70,13 @@ export const VOICE_ERROR_LABELS: Record<VoiceError, string> = {
 
 export const VOICE_ERROR_HINTS: Record<VoiceError, string> = {
   "microphone-unavailable": "The capture device did not respond. Check the voice gateway link.",
+  "microphone-permission":
+    "The browser blocked microphone access. Allow the microphone for this site, then try again.",
+  "microphone-missing": "No input device is available. Connect a microphone and try again.",
+  "recording-unsupported":
+    "This browser cannot record audio. Try a current Chrome, Edge or Firefox build.",
+  "recording-empty": "Hold the mic (or space) while you speak, then release to send.",
+  "no-speech": "Nothing was recognised in the clip, so no agent was asked to respond.",
   "transcription-failed": "Speech-to-text returned no usable transcript for this turn.",
   "synthesis-failed": "Voice output could not be generated. The text reply is still available.",
   "agent-unavailable": "The selected agent is not reachable right now.",

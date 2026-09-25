@@ -29,6 +29,8 @@ const modeLabel: Record<RoutingMode, string> = {
 
 const stateTone: Record<VoiceState, string> = {
   idle: "text-foreground-700",
+  recording: "text-accent-300",
+  uploading: "text-primary-300",
   listening: "text-accent-300",
   transcribing: "text-primary-300",
   routing: "text-primary-300",

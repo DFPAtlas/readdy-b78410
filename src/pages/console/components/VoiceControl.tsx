@@ -55,6 +55,19 @@ const voiceStateMeta: Record<VoiceState, VoiceStateMeta> = {
     caption: "text-foreground-500",
     hint: "Hold space or press the mic · press Escape to cancel",
   },
+  recording: {
+    icon: "ri-mic-fill",
+    button: "border-accent-400 bg-accent-500/25 text-accent-300",
+    caption: "text-accent-300",
+    hint: "Recording · release to send",
+  },
+  uploading: {
+    icon: "ri-upload-cloud-2-line",
+    button: "border-primary-400 bg-primary-500/20 text-primary-300",
+    caption: "text-primary-300",
+    hint: "Sending audio to the Atlas Voice Gateway",
+    spin: true,
+  },
   listening: {
     icon: "ri-mic-fill",
     button: "border-accent-400 bg-accent-500/25 text-accent-300",
@@ -102,6 +115,8 @@ const voiceStateMeta: Record<VoiceState, VoiceStateMeta> = {
 
 const waveTone: Record<VoiceState, "primary" | "accent" | "secondary" | "foreground"> = {
   idle: "foreground",
+  recording: "accent",
+  uploading: "primary",
   listening: "accent",
   transcribing: "primary",
   routing: "primary",
@@ -141,7 +156,11 @@ export default function VoiceControl({
   const isSpeaking = speakingAgent !== null;
   const offline = gatewayMode === "offline";
   const waveActive =
-    voiceState === "listening" || voiceState === "transcribing" || isSpeaking;
+    voiceState === "recording" ||
+    voiceState === "uploading" ||
+    voiceState === "listening" ||
+    voiceState === "transcribing" ||
+    isSpeaking;
   const routeLabel = routingMode === "auto" ? "AUTO" : routingMode.toUpperCase();
   const ringTone =
     speakingAgent === "tron" ? "border-secondary-500/50" : "border-accent-500/50";

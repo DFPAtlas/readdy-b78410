@@ -11,6 +11,7 @@ import {
   type GatewayEvent,
   type GatewayMode,
   type GatewayPreference,
+  type VoiceResponsePayload,
 } from "@/pages/console/gateway/contracts";
 import type { AgentId, RoutingMode } from "@/pages/console/types";
 
@@ -44,6 +45,7 @@ export interface GatewayApi {
     routingMode: RoutingMode,
     preferredAgent: AgentId | null,
   ) => Promise<ChatResponsePayload>;
+  sendVoice: (form: FormData) => Promise<VoiceResponsePayload>;
   cancelRequest: () => void;
   interruptSpeech: () => void;
   pushRoutingMode: (mode: RoutingMode) => void;
@@ -212,6 +214,31 @@ export function useVoiceGateway(): GatewayApi {
     [sendChat],
   );
 
+  const sendVoice = useCallback(async (form: FormData): Promise<VoiceResponsePayload> => {
+    const client = clientRef.current;
+    if (!client || !gatewayConfig.configured) {
+      const info: GatewayErrorInfo = {
+        kind: "not-configured",
+        message: GATEWAY_ERROR_HINTS["not-configured"],
+      };
+      setError(info);
+      throw new GatewayError("not-configured");
+    }
+    try {
+      const result = await client.sendVoice(form);
+      setError(null);
+      return result;
+    } catch (failure) {
+      const info =
+        failure instanceof GatewayError
+          ? failure.toInfo()
+          : { kind: "unreachable" as GatewayErrorKind, message: GATEWAY_ERROR_HINTS.unreachable };
+      // A user-initiated cancellation is not an error worth surfacing.
+      if (info.kind !== "request-cancelled") setError(info);
+      throw failure;
+    }
+  }, []);
+
   const cancelRequest = useCallback(() => {
     clientRef.current?.cancelRequest();
   }, []);
@@ -276,6 +303,7 @@ export function useVoiceGateway(): GatewayApi {
     reportError,
     sendChat,
     sendTranscript,
+    sendVoice,
     cancelRequest,
     interruptSpeech,
     pushRoutingMode,

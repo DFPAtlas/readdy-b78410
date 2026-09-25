@@ -58,7 +58,7 @@ export interface ChatRequestPayload {
   preferredAgent: AgentId | null;
 }
 
-export type ChatResponseStatus = "complete" | "partial" | "error";
+export type ChatResponseStatus = "complete" | "partial" | "interrupted" | "error";
 
 export interface ChatResponsePayload {
   requestId: string;
@@ -70,6 +70,40 @@ export interface ChatResponsePayload {
   status: ChatResponseStatus;
 }
 
+/* ------------------------------------------------------------- voice API */
+
+/** Lifecycle result reported by `POST /api/voice`. */
+export type VoiceResponseStatus = "complete" | "no_speech_detected" | "partial" | "error";
+
+/**
+ * Successful body of `POST /api/voice` (multipart upload).
+ *
+ * The gateway transcribes the clip, routes the transcript through the SAME
+ * pipeline as `/api/chat`, and returns the transcript plus the routed reply in
+ * one round-trip. Speech fields are present because the gateway also
+ * synthesizes the reply — the console does not play them yet, so they are
+ * carried but unused.
+ */
+export interface VoiceResponsePayload {
+  requestId: string | null;
+  sessionId: string;
+  selectedAgent: AgentId | null;
+  transcript: string;
+  language: string | null;
+  duration: number | null;
+  processingTime: number | null;
+  response: string;
+  model: string;
+  latency: number;
+  status: VoiceResponseStatus;
+  sttModel: string | null;
+  speechStatus: string | null;
+  audioRef: string | null;
+  audioContentType: string | null;
+  speechDurationMs: number | null;
+  selectedVoiceId: string | null;
+}
+
 /* --------------------------------------------------------- WebSocket API */
 
 export type GatewayEventType =
@@ -77,14 +111,21 @@ export type GatewayEventType =
   | "agent_status"
   | "routing_started"
   | "agent_selected"
+  | "audio_received"
+  | "transcription_started"
+  | "transcription_failed"
   | "transcript_partial"
   | "transcript_final"
   | "agent_thinking"
   | "response_started"
   | "response_delta"
   | "response_complete"
+  | "speech_synthesis_started"
+  | "speech_ready"
   | "speech_started"
   | "speech_ended"
+  | "speech_cancelled"
+  | "speech_failed"
   | "handoff"
   | "activity"
   | "error"
@@ -116,6 +157,8 @@ export interface GatewayEvent {
   text?: string;
   delta?: string;
   message?: string;
+  /** Machine-readable failure code (e.g. `no_speech_detected`, `stt_busy`). */
+  code?: string;
   label?: string;
   detail?: string;
   status?: string;
@@ -135,20 +178,34 @@ export type GatewayErrorKind =
   | "unreachable"
   | "timeout"
   | "malformed-response"
+  | "unknown-agent"
   | "socket-disconnect"
   | "request-cancelled"
   | "agent-unavailable"
-  | "routing-failure";
+  | "routing-failure"
+  | "unsupported-audio"
+  | "audio-too-large"
+  | "audio-too-short"
+  | "no-speech"
+  | "agent-busy"
+  | "voice-failure";
 
 export const GATEWAY_ERROR_LABELS: Record<GatewayErrorKind, string> = {
   "not-configured": "Voice Gateway not configured",
   unreachable: "Voice Gateway unreachable",
   timeout: "Gateway request timed out",
   "malformed-response": "Malformed gateway response",
+  "unknown-agent": "Unrecognised agent id from gateway",
   "socket-disconnect": "Live event stream disconnected",
   "request-cancelled": "Request cancelled",
   "agent-unavailable": "Agent unavailable",
   "routing-failure": "Routing failed",
+  "unsupported-audio": "Unsupported audio",
+  "audio-too-large": "Recording too large",
+  "audio-too-short": "Recording too short",
+  "no-speech": "No speech detected",
+  "agent-busy": "Agents busy",
+  "voice-failure": "Voice processing failed",
 };
 
 export const GATEWAY_ERROR_HINTS: Record<GatewayErrorKind, string> = {
@@ -158,10 +215,18 @@ export const GATEWAY_ERROR_HINTS: Record<GatewayErrorKind, string> = {
     "The console could not reach the Atlas Voice Gateway. Check the host and try again.",
   timeout: "No response arrived inside the expected window.",
   "malformed-response": "The gateway returned a payload the console could not read.",
+  "unknown-agent":
+    "The gateway returned an agent id the console does not recognise, so no reply was shown. Expected atlas-hal or atlas-tron.",
   "socket-disconnect": "The live event stream dropped. The conversation is preserved.",
   "request-cancelled": "The in-flight request was cancelled locally.",
   "agent-unavailable": "The selected agent could not take the request.",
   "routing-failure": "The router could not decide which agent should answer.",
+  "unsupported-audio": "This browser produced an audio format the gateway cannot decode. Try another browser.",
+  "audio-too-large": "The clip exceeded the gateway's size or duration limit. Keep recordings shorter.",
+  "audio-too-short": "The clip was too short to transcribe. Hold the mic while you speak.",
+  "no-speech": "Nothing was recognised in the clip, so no agent was asked to respond.",
+  "agent-busy": "The gateway is handling as many requests as it allows. Try again shortly.",
+  "voice-failure": "The gateway could not process the voice request. No reply was fabricated.",
 };
 
 export interface GatewayErrorInfo {

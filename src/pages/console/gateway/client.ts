@@ -11,7 +11,14 @@ import {
   type GatewayEventType,
   type GatewayMode,
   type GatewaySocketState,
+  type VoiceResponsePayload,
 } from "@/pages/console/gateway/contracts";
+import {
+  hasUnknownAgentId,
+  normalizeChatResponse,
+  normalizeGatewayEvent,
+  normalizeVoiceResponse,
+} from "@/pages/console/gateway/normalize";
 
 /**
  * The single reusable service for every Atlas Voice Gateway interaction.
@@ -56,8 +63,12 @@ export class GatewayError extends Error {
 }
 
 const CHAT_PATH = "/api/chat";
+const VOICE_PATH = "/api/voice";
 const SOCKET_PATH = "/ws";
 const REQUEST_TIMEOUT_MS = 20000;
+// Voice requests cover upload + local transcription + generation + synthesis, so
+// they legitimately take far longer than a text round-trip.
+const VOICE_REQUEST_TIMEOUT_MS = 120000;
 const HEARTBEAT_TIMEOUT_MS = 45000;
 const HEARTBEAT_POLL_MS = 15000;
 const BACKOFF_BASE_MS = 1000;
@@ -78,6 +89,8 @@ export class AtlasVoiceGateway {
   private heartbeatTimer: number | null = null;
 
   private abortController: AbortController | null = null;
+
+  private cancelRequested = false;
 
   private reconnectAttempt = 0;
 
@@ -247,16 +260,19 @@ export class AtlasVoiceGateway {
         body: JSON.stringify(payload),
         signal: controller.signal,
       });
-      if (!response.ok) {
-        throw new GatewayError("unreachable", `Voice Gateway responded ${response.status}`);
-      }
       const text = await response.text();
-      let parsed: unknown;
+      let parsed: unknown = null;
       try {
         parsed = JSON.parse(text);
       } catch {
-        throw new GatewayError("malformed-response");
+        parsed = null;
       }
+      // A non-2xx body is mapped to a specific, typed gateway error — in
+      // particular a rejected `preferredAgent` (HTTP 400 `unknown_agent`)
+      // surfaces as a clear contract error rather than a generic failure. This
+      // mirrors how /api/voice error bodies are mapped.
+      if (!response.ok) throw this.chatErrorFromBody(response.status, parsed);
+      if (parsed === null) throw new GatewayError("malformed-response");
       const data = this.parseChatResponse(parsed);
       this.activeRequestId = data.requestId;
       this.emitDiagnostics();
@@ -284,7 +300,59 @@ export class AtlasVoiceGateway {
     });
   }
 
+  /**
+   * Upload a captured clip to `POST /api/voice`.
+   *
+   * The audio goes to the Atlas Voice Gateway and nowhere else. Multipart is
+   * sent as-is so the browser sets the boundary — the caller must NOT append a
+   * Content-Type header. Errors are mapped to the specific gateway failure so
+   * the console can show an accurate message.
+   */
+  async sendVoice(form: FormData): Promise<VoiceResponsePayload> {
+    if (!gatewayConfig.configured) throw new GatewayError("not-configured");
+    if (this.connection !== "connected" && this.connection !== "degraded") {
+      throw new GatewayError("unreachable", GATEWAY_ERROR_HINTS.unreachable);
+    }
+
+    const controller = new AbortController();
+    this.abortController = controller;
+    this.cancelRequested = false;
+    const timeout = window.setTimeout(() => controller.abort(), VOICE_REQUEST_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(toHttpUrl(VOICE_PATH), {
+        method: "POST",
+        body: form,
+        signal: controller.signal,
+      });
+      const text = await response.text();
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        throw new GatewayError("malformed-response");
+      }
+      if (!response.ok) throw this.voiceErrorFromBody(response.status, parsed);
+      const data = this.parseVoiceResponse(parsed);
+      this.activeRequestId = data.requestId;
+      this.emitDiagnostics();
+      return data;
+    } catch (error) {
+      if (error instanceof GatewayError) throw error;
+      const aborted = error instanceof DOMException && error.name === "AbortError";
+      if (aborted) {
+        throw new GatewayError(this.cancelRequested ? "request-cancelled" : "timeout");
+      }
+      throw new GatewayError("unreachable");
+    } finally {
+      window.clearTimeout(timeout);
+      this.abortController = null;
+      this.cancelRequested = false;
+    }
+  }
+
   cancelRequest(): void {
+    this.cancelRequested = true;
     this.abortController?.abort();
     this.abortController = null;
     this.activeRequestId = null;
@@ -307,24 +375,97 @@ export class AtlasVoiceGateway {
   /* -------------------------------------------------------- internal helpers */
 
   private parseChatResponse(value: unknown): ChatResponsePayload {
-    if (!value || typeof value !== "object") throw new GatewayError("malformed-response");
-    const record = value as Record<string, unknown>;
-    const { selectedAgent } = record;
-    if (selectedAgent !== "hal" && selectedAgent !== "tron") {
+    // Agent ids (`atlas-hal` / `atlas-tron`) are normalized to the console's
+    // `hal` / `tron` INSIDE normalizeChatResponse, before any validation or
+    // conversation update. A missing or unknown agent id stays a hard contract
+    // error and is never silently relabelled HAL or TRON.
+    const data = normalizeChatResponse(value, this.sessionId);
+    if (!data) {
+      if (hasUnknownAgentId(value)) throw new GatewayError("unknown-agent");
       throw new GatewayError("malformed-response");
     }
-    if (typeof record.response !== "string") throw new GatewayError("malformed-response");
+    return data;
+  }
 
-    const status = record.status;
-    return {
-      requestId: typeof record.requestId === "string" ? record.requestId : `req-${Date.now()}`,
-      sessionId: typeof record.sessionId === "string" ? record.sessionId : this.sessionId,
-      selectedAgent,
-      response: record.response,
-      model: typeof record.model === "string" ? record.model : "Unknown",
-      latency: typeof record.latency === "number" ? record.latency : 0,
-      status: status === "partial" || status === "error" ? status : "complete",
-    };
+  private parseVoiceResponse(value: unknown): VoiceResponsePayload {
+    // Same canonical agent-id resolution as the text path: a voice body whose
+    // agent id is PRESENT but unrecognised is a hard contract error, never a
+    // silent `null`. A missing id alongside reply text is equally unusable, so
+    // an unattributable reply is never rendered as an empty message.
+    const data = normalizeVoiceResponse(value, this.sessionId);
+    if (!data) {
+      if (hasUnknownAgentId(value)) throw new GatewayError("unknown-agent");
+      throw new GatewayError("malformed-response");
+    }
+    if (
+      !data.selectedAgent &&
+      data.response.trim() !== "" &&
+      data.status !== "no_speech_detected"
+    ) {
+      throw new GatewayError("unknown-agent");
+    }
+    return data;
+  }
+
+  /** Map a non-2xx `/api/chat` body to a specific, typed gateway error. */
+  private chatErrorFromBody(status: number, value: unknown): GatewayError {
+    const record = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
+    const code = typeof record.code === "string" ? record.code : "";
+    const message = typeof record.message === "string" ? record.message : undefined;
+
+    switch (code) {
+      case "unknown_agent":
+        return new GatewayError("unknown-agent", message);
+      case "agent_unavailable":
+      case "local_ai_unavailable":
+      case "agent_unreachable":
+        return new GatewayError("agent-unavailable", message);
+      case "agent_busy":
+      case "too_many_requests":
+        return new GatewayError("agent-busy", message);
+      default:
+        break;
+    }
+
+    if (status === 408 || status === 504) return new GatewayError("timeout", message);
+    return new GatewayError("unreachable", message ?? `Voice Gateway responded ${status}`);
+  }
+
+  /** Map a non-2xx `/api/voice` body to a specific, typed gateway error. */
+  private voiceErrorFromBody(status: number, value: unknown): GatewayError {
+    const record = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
+    const code = typeof record.code === "string" ? record.code : "";
+    const message = typeof record.message === "string" ? record.message : undefined;
+
+    switch (code) {
+      case "unsupported_type":
+        return new GatewayError("unsupported-audio", message);
+      case "too_large":
+      case "audio_too_long":
+      case "message_too_large":
+        return new GatewayError("audio-too-large", message);
+      case "audio_too_short":
+        return new GatewayError("audio-too-short", message);
+      case "stt_busy":
+      case "agent_busy":
+      case "too_many_requests":
+        return new GatewayError("agent-busy", message);
+      case "agent_unavailable":
+      case "local_ai_unavailable":
+      case "agent_unreachable":
+        return new GatewayError("agent-unavailable", message);
+      case "no_speech_detected":
+        return new GatewayError("no-speech", message);
+      case "unknown_agent":
+        return new GatewayError("unknown-agent", message);
+      default:
+        break;
+    }
+
+    if (status === 415) return new GatewayError("unsupported-audio", message);
+    if (status === 413) return new GatewayError("audio-too-large", message);
+    if (status === 408 || status === 504) return new GatewayError("timeout", message);
+    return new GatewayError("voice-failure", message);
   }
 
   private handleRawEvent(data: unknown): void {
@@ -336,9 +477,12 @@ export class AtlasVoiceGateway {
       this.emitEvent({ type: "error", message: "Malformed event payload" });
       return;
     }
-    if (!parsed || typeof parsed !== "object") return;
-    const event = parsed as GatewayEvent;
-    if (typeof event.type !== "string") return;
+
+    // Every inbound event passes through the shared normalization layer, which
+    // maps gateway agent ids (`atlas-hal`) to console ids (`hal`) and flattens
+    // the gateway's nested `payload` into the console's typed event.
+    const event = normalizeGatewayEvent(parsed);
+    if (!event) return;
 
     if (event.type === "heartbeat") this.lastHeartbeat = Date.now();
     if (event.requestId) this.activeRequestId = event.requestId;

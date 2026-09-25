@@ -29,6 +29,7 @@ import {
 import { agentForText, detectIntent, intentLabel, otherAgent } from "@/pages/console/routing";
 import { VOICE_TIMINGS, clockStamp, createSession } from "@/pages/console/session";
 import { useVoiceGateway, type GatewayApi } from "@/pages/console/hooks/useVoiceGateway";
+import { useLiveVoiceTurn } from "@/pages/console/hooks/useLiveVoiceTurn";
 import { gatewayConfig } from "@/pages/console/gateway/config";
 import {
   GATEWAY_ERROR_HINTS,
@@ -136,7 +137,6 @@ export function useVoiceConsole(): VoiceConsoleApi {
   const gatewayApiRef = useRef(gateway);
   const modeRef = useRef(gateway.mode);
   const sessionStateRef = useRef(session);
-  const streamMessageRef = useRef<string | null>(null);
   const scheduleContinuousRef = useRef<() => void>(() => {});
 
   const idRef = useRef(9000);
@@ -358,148 +358,6 @@ export function useVoiceConsole(): VoiceConsoleApi {
     reportGatewayProblem(info);
   }, [reportGatewayProblem]);
 
-  /**
-   * LIVE request path.
-   *
-   * The browser only ever talks to the Atlas Voice Gateway — never to HAL or
-   * TRON directly. If the gateway call fails, no answer is fabricated: the
-   * request is marked failed and a readable error is shown instead.
-   */
-  const runLiveRequest = useCallback(
-    async (
-      raw: string,
-      options: { userMessageId: string | null; viaVoice: boolean; clearLog: boolean },
-    ) => {
-      const api = gatewayApiRef.current;
-      const text = raw.trim() || defaultPrompt;
-      busyRef.current = true;
-      lastRequestRef.current = { text, mode: routingModeRef.current };
-      stopPartialReveal();
-      clearPartialLine();
-      if (options.clearLog) clearTranscriptLines();
-
-      setVoiceError(null);
-      setFailover(null);
-      api.clearError();
-      applyVoiceState("routing");
-      setSession((prev) => ({
-        ...prev,
-        state: "routing",
-        mode: routingModeRef.current,
-        targetAgent: routingModeRef.current === "auto" ? null : routingModeRef.current,
-        startedAt: prev.startedAt ?? Date.now(),
-        finalTranscript: text,
-      }));
-      pushTranscript("status", "Request received");
-      pushTranscript("status", "Routing request...");
-
-      const evtId = nextId("evt");
-      pushEvent({
-        id: evtId,
-        type: "request",
-        label: "Request received",
-        detail: "Atlas Voice Gateway · live",
-        timestamp: clockStamp(),
-        status: "active",
-        agent: "system",
-      });
-
-      try {
-        const result = await api.sendChat({
-          message: text,
-          routingMode: routingModeRef.current,
-          preferredAgent: routingModeRef.current === "auto" ? null : routingModeRef.current,
-        });
-
-        if (options.userMessageId) patchMessage(options.userMessageId, { status: "complete" });
-        updateEvent(evtId, { status: "complete" });
-        setSession((prev) => ({ ...prev, selectedAgent: result.selectedAgent }));
-        pushTranscript("status", `${result.selectedAgent.toUpperCase()} selected`);
-
-        // Only render the HTTP reply directly when the gateway is not streaming.
-        if (!streamMessageRef.current && result.response.trim()) {
-          pushMessage({
-            id: nextId("msg"),
-            sender: nameForAgent(result.selectedAgent),
-            senderType: result.selectedAgent,
-            text: result.response,
-            timestamp: clockStamp(),
-            model: result.model,
-            latency: result.latency,
-            status: "complete",
-            tools: [{ label: "voice-gateway", kind: "route" }],
-          });
-        }
-
-        applyVoiceState("idle");
-        setSession((prev) => ({ ...prev, state: "idle", canInterrupt: false }));
-        busyRef.current = false;
-        pushEvent({
-          id: nextId("evt"),
-          type: "done",
-          label: "Response complete",
-          detail: `${nameForAgent(result.selectedAgent)} → console`,
-          timestamp: clockStamp(),
-          status: "complete",
-          agent: result.selectedAgent,
-        });
-        scheduleContinuousRef.current();
-      } catch {
-        if (options.userMessageId) patchMessage(options.userMessageId, { status: "failed" });
-        streamMessageRef.current = null;
-        markSpeakingMessages("failed");
-        clearAllSpeaking();
-        updateEvent(evtId, { status: "failed" });
-        applyVoiceState("idle");
-        setSession((prev) => ({ ...prev, state: "idle", canInterrupt: false }));
-        busyRef.current = false;
-        pushTranscript("error", "Live request failed");
-        pushEvent({
-          id: nextId("evt"),
-          type: "error",
-          label: "Live request failed",
-          detail: "No response generated · gateway error",
-          timestamp: clockStamp(),
-          status: "failed",
-          agent: "system",
-        });
-      }
-    },
-    [
-      applyVoiceState,
-      clearAllSpeaking,
-      clearPartialLine,
-      clearTranscriptLines,
-      markSpeakingMessages,
-      nameForAgent,
-      nextId,
-      patchMessage,
-      pushEvent,
-      pushMessage,
-      pushTranscript,
-      stopPartialReveal,
-      updateEvent,
-    ],
-  );
-
-  const sendLiveText = useCallback(
-    (raw: string) => {
-      if (busyRef.current) return;
-      const text = raw.trim() || defaultPrompt;
-      const userId = nextId("msg");
-      pushMessage({
-        id: userId,
-        sender: mockOperator.name,
-        senderType: "user",
-        text,
-        timestamp: clockStamp(),
-        status: "sending",
-      });
-      void runLiveRequest(text, { userMessageId: userId, viaVoice: false, clearLog: true });
-    },
-    [nextId, pushMessage, runLiveRequest],
-  );
-
   /* ------------------------------------------------------------ error paths */
 
   const raiseVoiceError = useCallback(
@@ -536,6 +394,50 @@ export function useVoiceConsole(): VoiceConsoleApi {
       stopPartialReveal,
     ],
   );
+
+  /* ---------------------------------------------- live gateway voice turns */
+
+  /**
+   * LIVE (real gateway) turns: microphone capture, `/api/voice` + `/api/chat`
+   * requests, and single-message reconciliation. The browser only ever talks to
+   * the Atlas Voice Gateway — never to HAL, TRON or Ollama directly.
+   */
+  const live = useLiveVoiceTurn({
+    getGateway: () => gatewayApiRef.current,
+    getSessionId: () => gatewayApiRef.current.sessionId,
+    getRoutingMode: () => routingModeRef.current,
+    getSelectedAgent: () => sessionStateRef.current.selectedAgent,
+    nextId,
+    pushMessage,
+    patchMessage,
+    appendMessageText: (id, chunk) =>
+      setMessages((prev) =>
+        prev.map((message) =>
+          message.id === id ? { ...message, text: message.text + chunk } : message,
+        ),
+      ),
+    pushEvent,
+    updateEvent,
+    pushTranscript,
+    clearTranscriptLines,
+    clearPartialLine,
+    setPartialLine,
+    stopPartialReveal,
+    applyVoiceState,
+    setAgentSpeaking,
+    clearAllSpeaking,
+    markSpeakingMessages,
+    updateSession: (updater) => setSession(updater),
+    replaceSession: (next) => setSession(next),
+    nameForAgent,
+    raiseVoiceError,
+    reportGatewayProblem,
+    scheduleContinuous: () => scheduleContinuousRef.current(),
+    markBusy: (nextBusy) => {
+      busyRef.current = nextBusy;
+    },
+    isBusy: () => busyRef.current,
+  });
 
   /* ------------------------------------------------------------ speech core */
 
@@ -1031,7 +933,7 @@ export function useVoiceConsole(): VoiceConsoleApi {
       const activeMode = modeRef.current;
       if (activeMode === "live") {
         // Voice transcript is submitted through the gateway exactly like text.
-        void runLiveRequest(phrase, { userMessageId: null, viaVoice: true, clearLog: false });
+        live.sendText(phrase);
       } else if (activeMode === "offline") {
         reportOffline();
         busyRef.current = false;
@@ -1042,13 +944,13 @@ export function useVoiceConsole(): VoiceConsoleApi {
   }, [
     applyVoiceState,
     clearPartialLine,
+    live,
     nextId,
     pushEvent,
     pushMessage,
     pushTranscript,
     reportOffline,
     resolveAndRespond,
-    runLiveRequest,
     schedule,
     stopPartialReveal,
   ]);
@@ -1124,10 +1026,9 @@ export function useVoiceConsole(): VoiceConsoleApi {
     const agent = speakingRef.current;
     if (!agent) return;
     const name = agent.toUpperCase();
-    if (modeRef.current === "live") gatewayApiRef.current.interruptSpeech();
-    if (streamMessageRef.current) {
-      patchMessage(streamMessageRef.current, { status: "interrupted" });
-      streamMessageRef.current = null;
+    if (modeRef.current === "live") {
+      gatewayApiRef.current.interruptSpeech();
+      live.interrupt();
     }
     clearTimers();
     stopPartialReveal();
@@ -1150,9 +1051,9 @@ export function useVoiceConsole(): VoiceConsoleApi {
   }, [
     clearPartialLine,
     clearTimers,
+    live,
     markSpeakingMessages,
     nextId,
-    patchMessage,
     pushEvent,
     pushTranscript,
     setAgentSpeaking,
@@ -1164,10 +1065,9 @@ export function useVoiceConsole(): VoiceConsoleApi {
     const agent = speakingRef.current;
     if (!agent) return;
     const name = agent.toUpperCase();
-    if (modeRef.current === "live") gatewayApiRef.current.interruptSpeech();
-    if (streamMessageRef.current) {
-      patchMessage(streamMessageRef.current, { status: "interrupted" });
-      streamMessageRef.current = null;
+    if (modeRef.current === "live") {
+      gatewayApiRef.current.interruptSpeech();
+      live.interrupt();
     }
     clearTimers();
     stopPartialReveal();
@@ -1191,9 +1091,9 @@ export function useVoiceConsole(): VoiceConsoleApi {
     applyVoiceState,
     clearPartialLine,
     clearTimers,
+    live,
     markSpeakingMessages,
     nextId,
-    patchMessage,
     pushEvent,
     pushTranscript,
     setAgentSpeaking,
@@ -1202,10 +1102,10 @@ export function useVoiceConsole(): VoiceConsoleApi {
 
   const cancelSession = useCallback(() => {
     if (voiceStateRef.current === "idle" && !failover && !voiceError) return;
-    if (modeRef.current === "live") gatewayApiRef.current.cancelRequest();
-    if (streamMessageRef.current) {
-      patchMessage(streamMessageRef.current, { status: "interrupted" });
-      streamMessageRef.current = null;
+    if (modeRef.current === "live") {
+      gatewayApiRef.current.cancelRequest();
+      live.interrupt();
+      live.reset();
     }
     clearTimers();
     stopPartialReveal();
@@ -1234,9 +1134,9 @@ export function useVoiceConsole(): VoiceConsoleApi {
     clearPartialLine,
     clearTimers,
     failover,
+    live,
     markSpeakingMessages,
     nextId,
-    patchMessage,
     pushEvent,
     pushTranscript,
     stopPartialReveal,
@@ -1271,15 +1171,23 @@ export function useVoiceConsole(): VoiceConsoleApi {
       reportOffline();
       return;
     }
+    if (modeRef.current === "live") {
+      void live.startCapture();
+      return;
+    }
     if (modeRef.current === "demo" && !gatewayRef.current) {
       raiseVoiceError("connection-lost", VOICE_ERROR_HINTS["connection-lost"]);
       return;
     }
     pressModeRef.current = "listen";
     startListeningSession();
-  }, [raiseVoiceError, reportOffline, startListeningSession]);
+  }, [live, raiseVoiceError, reportOffline, startListeningSession]);
 
   const endPress = useCallback(() => {
+    if (modeRef.current === "live" && live.isCapturing()) {
+      void live.endCapture();
+      return;
+    }
     if (pressModeRef.current !== "listen") {
       pressModeRef.current = null;
       return;
@@ -1289,7 +1197,7 @@ export function useVoiceConsole(): VoiceConsoleApi {
     const wait = Math.max(0, VOICE_TIMINGS.minListen - elapsed);
     if (wait > 0) schedule(() => endListeningRef.current(), wait);
     else endListeningRef.current();
-  }, [schedule]);
+  }, [live, schedule]);
 
   useEffect(() => {
     beginPressRef.current = beginPress;
@@ -1314,6 +1222,15 @@ export function useVoiceConsole(): VoiceConsoleApi {
       interruptRef.current();
       return;
     }
+    if (modeRef.current === "live") {
+      if (live.isCapturing()) {
+        void live.endCapture();
+        return;
+      }
+      if (busyRef.current) return;
+      void live.startCapture();
+      return;
+    }
     if (state === "listening") {
       endListeningRef.current();
       return;
@@ -1332,7 +1249,7 @@ export function useVoiceConsole(): VoiceConsoleApi {
     schedule(() => {
       if (voiceStateRef.current === "listening") endListeningRef.current();
     }, VOICE_TIMINGS.tapListen);
-  }, [raiseVoiceError, reportOffline, schedule, startListeningSession]);
+  }, [live, raiseVoiceError, reportOffline, schedule, startListeningSession]);
 
   const applyAgentStatus = useCallback((payload: AgentStatusPayload) => {
     setAgents((prev) => {
@@ -1351,6 +1268,11 @@ export function useVoiceConsole(): VoiceConsoleApi {
    */
   const handleGatewayEvent = useCallback(
     (event: GatewayEvent) => {
+      // LIVE turns own their events: the turn controller matches by session +
+      // request and reconciles exactly one user/assistant message. Only events
+      // with no matching active turn fall through to this generic router.
+      if (live.handleEvent(event)) return;
+
       switch (event.type) {
         case "agent_status": {
           const payloads = event.agentStatuses ?? (event.agentStatus ? [event.agentStatus] : []);
@@ -1388,6 +1310,36 @@ export function useVoiceConsole(): VoiceConsoleApi {
           });
           break;
         }
+        case "audio_received": {
+          pushEvent({
+            id: nextId("evt"),
+            type: "voice",
+            label: "Audio received",
+            detail: "Atlas Voice Gateway · validated",
+            timestamp: clockStamp(),
+            status: "complete",
+            agent: "system",
+          });
+          break;
+        }
+        case "transcription_started": {
+          applyVoiceState("transcribing");
+          setSession((prev) => ({ ...prev, state: "transcribing" }));
+          break;
+        }
+        case "transcription_failed": {
+          pushTranscript("error", "Transcription failed");
+          pushEvent({
+            id: nextId("evt"),
+            type: "error",
+            label: "Transcription failed",
+            detail: "Atlas Voice Gateway · speech-to-text",
+            timestamp: clockStamp(),
+            status: "failed",
+            agent: "system",
+          });
+          break;
+        }
         case "transcript_partial": {
           if (event.text) setPartialLine(event.text);
           break;
@@ -1406,78 +1358,18 @@ export function useVoiceConsole(): VoiceConsoleApi {
           pushTranscript("status", `${(event.agent ?? "agent").toUpperCase()} thinking...`);
           break;
         }
-        case "response_started": {
-          const agentId = event.agent ?? sessionStateRef.current.selectedAgent;
-          if (!agentId) break;
-          const id = nextId("msg");
-          streamMessageRef.current = id;
-          applyVoiceState(agentId === "hal" ? "hal-speaking" : "tron-speaking");
-          setAgentSpeaking(agentId, true);
-          setSession((prev) => ({
-            ...prev,
-            selectedAgent: agentId,
-            state: agentId === "hal" ? "hal-speaking" : "tron-speaking",
-            responseStartedAt: Date.now(),
-            canInterrupt: true,
-          }));
-          pushMessage({
-            id,
-            sender: nameForAgent(agentId),
-            senderType: agentId,
-            text: "",
-            timestamp: clockStamp(),
-            status: "processing",
-          });
-          pushTranscript("agent", `${nameForAgent(agentId)} speaking`);
+        case "response_started":
+          // Turn-scoped rendering is owned by the live turn controller; any
+          // event reaching here has no matching turn, so it is ignored.
           break;
-        }
-        case "response_delta": {
-          const id = streamMessageRef.current;
-          const chunk = event.delta ?? event.text ?? "";
-          if (!id || !chunk) break;
-          setMessages((prev) =>
-            prev.map((message) =>
-              message.id === id ? { ...message, text: message.text + chunk } : message,
-            ),
-          );
+        case "response_delta":
           break;
-        }
         case "response_complete": {
+          // The live turn controller owns turn-scoped completion. This fallback
+          // only clears lingering speaking state and never creates a message, so
+          // a reconciled reply can never be duplicated.
           const agentId = event.agent ?? sessionStateRef.current.selectedAgent;
-          const id = streamMessageRef.current;
-          if (id) {
-            const patch: Partial<ChatMessage> = { status: "complete" };
-            if (event.text) patch.text = event.text;
-            if (event.model) patch.model = event.model;
-            if (typeof event.latency === "number") patch.latency = event.latency;
-            patchMessage(id, patch);
-            streamMessageRef.current = null;
-          } else if (event.text && agentId) {
-            pushMessage({
-              id: nextId("msg"),
-              sender: nameForAgent(agentId),
-              senderType: agentId,
-              text: event.text,
-              timestamp: clockStamp(),
-              model: event.model,
-              latency: event.latency,
-              status: "complete",
-            });
-          }
           if (agentId) setAgentSpeaking(agentId, false);
-          applyVoiceState("idle");
-          setSession((prev) => ({ ...prev, state: "idle", canInterrupt: false }));
-          busyRef.current = false;
-          pushEvent({
-            id: nextId("evt"),
-            type: "done",
-            label: "Response complete",
-            detail: `${agentId ? nameForAgent(agentId) : "Agent"} → console`,
-            timestamp: clockStamp(),
-            status: "complete",
-            agent: agentId ?? "system",
-          });
-          scheduleContinuousRef.current();
           break;
         }
         case "speech_started": {
@@ -1495,11 +1387,6 @@ export function useVoiceConsole(): VoiceConsoleApi {
         case "speech_ended": {
           const agentId = event.agent ?? sessionStateRef.current.selectedAgent;
           if (agentId) setAgentSpeaking(agentId, false);
-          if (!streamMessageRef.current) {
-            applyVoiceState("idle");
-            setSession((prev) => ({ ...prev, state: "idle", canInterrupt: false }));
-          }
-          scheduleContinuousRef.current();
           break;
         }
         case "handoff": {
@@ -1558,9 +1445,9 @@ export function useVoiceConsole(): VoiceConsoleApi {
       applyAgentStatus,
       applyVoiceState,
       clearPartialLine,
+      live,
       nameForAgent,
       nextId,
-      patchMessage,
       pushEvent,
       pushMessage,
       pushTranscript,
@@ -1572,6 +1459,21 @@ export function useVoiceConsole(): VoiceConsoleApi {
   /** Continuous Conversation: auto-return to listening after a live reply. */
   const runContinuousLoop = useCallback(() => {
     if (!continuousRef.current) return;
+
+    if (modeRef.current === "live") {
+      // Live mode: start a real microphone capture, never the simulation.
+      schedule(() => {
+        if (!continuousRef.current) return;
+        void (async () => {
+          await live.startCapture();
+          schedule(() => {
+            if (continuousRef.current) void live.endCapture();
+          }, VOICE_TIMINGS.continuousListen);
+        })();
+      }, VOICE_TIMINGS.continuousPause);
+      return;
+    }
+
     applyVoiceState("idle");
     setSession((prev) => ({ ...prev, state: "listening" }));
     schedule(() => {
@@ -1581,7 +1483,7 @@ export function useVoiceConsole(): VoiceConsoleApi {
         if (continuousRef.current) endListeningRef.current();
       }, VOICE_TIMINGS.continuousListen);
     }, VOICE_TIMINGS.continuousPause);
-  }, [applyVoiceState, schedule]);
+  }, [applyVoiceState, live, schedule]);
 
   useEffect(() => {
     scheduleContinuousRef.current = runContinuousLoop;
@@ -1669,7 +1571,7 @@ export function useVoiceConsole(): VoiceConsoleApi {
     if (!raw.trim()) return;
     setInputValue("");
     if (modeRef.current === "live") {
-      sendLiveText(raw);
+      live.sendText(raw);
       return;
     }
     if (modeRef.current === "offline") {
@@ -1677,16 +1579,24 @@ export function useVoiceConsole(): VoiceConsoleApi {
       return;
     }
     startTextTurn(raw, routingModeRef.current);
-  }, [inputValue, reportOffline, sendLiveText, startTextTurn]);
+  }, [inputValue, live, reportOffline, startTextTurn]);
 
   const talkTo = useCallback(
     (agent: AgentId) => {
       if (busyRef.current) return;
       setRoutingMode(agent);
+      if (modeRef.current === "live") {
+        void live.startCapture().then(() => {
+          schedule(() => {
+            void live.endCapture();
+          }, VOICE_TIMINGS.tapListen);
+        });
+        return;
+      }
       startListeningSession();
       schedule(() => endListeningRef.current(), VOICE_TIMINGS.tapListen);
     },
-    [schedule, setRoutingMode, startListeningSession],
+    [live, schedule, setRoutingMode, startListeningSession],
   );
 
   const toggleMute = useCallback(
@@ -1789,7 +1699,6 @@ export function useVoiceConsole(): VoiceConsoleApi {
     clearTranscriptLines();
     setFailover(null);
     setVoiceError(null);
-    streamMessageRef.current = null;
     gatewayApiRef.current.clearError();
     applyVoiceState("idle");
     const sessionId = gatewayApiRef.current.newSession();

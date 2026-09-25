@@ -426,6 +426,30 @@ def _parse_speak_flag(raw: Optional[str]) -> Optional[bool]:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+# Agent ids the gateway understands as a caller-supplied routing hint. This
+# mirrors the ids ``_resolve_route`` accepts so an unknown id is never silently
+# dropped on the voice path.
+KNOWN_AGENT_HINTS: frozenset[str] = frozenset({"atlas-hal", "hal", "atlas-tron", "tron"})
+
+
+def _unknown_preferred_agent(preferred_agent: Optional[str]) -> Optional[str]:
+    """Return the offending id when an explicit preferred agent is unrecognised.
+
+    ``None`` means "no explicit agent requested" or "a valid one" - both of which
+    the router handles normally. An unrecognised id is returned verbatim so the
+    caller can reject the request explicitly instead of falling through.
+    """
+
+    if preferred_agent is None:
+        return None
+    candidate = preferred_agent.strip()
+    if not candidate:
+        return None
+    if candidate.lower() in KNOWN_AGENT_HINTS:
+        return None
+    return candidate
+
+
 # ---------------------------------------------------------------------- loops
 
 
@@ -616,6 +640,31 @@ async def set_mute(agent_id: str, payload: MuteRequest, request: Request) -> dic
 @app.post("/api/chat")
 async def chat(payload: ChatRequest, request: Request):
     state: AppContext = request.app.state.ctx
+
+    # An explicitly requested agent id the gateway does not recognise is a real
+    # request error: return a structured 400 instead of silently dropping the
+    # hint and letting AUTO routing pick a different agent. This mirrors the
+    # /api/voice guard and reuses the same canonical id rules
+    # (``KNOWN_AGENT_HINTS`` / ``_unknown_preferred_agent``). Omitting
+    # preferredAgent and valid HAL/TRON hints are unaffected.
+    unknown_agent = _unknown_preferred_agent(payload.preferredAgent)
+    if unknown_agent is not None:
+        await state.connections.broadcast(
+            event(
+                "error",
+                sessionId=payload.sessionId,
+                payload={"code": "unknown_agent", "message": f"Unknown preferred agent: {unknown_agent}"},
+            )
+        )
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "code": "unknown_agent",
+                "message": f"Unknown preferred agent: {unknown_agent}",
+            },
+        )
+
     status_code, body = await _execute_chat(
         state,
         payload.sessionId,
@@ -728,6 +777,29 @@ async def voice_endpoint(
         raise HTTPException(status_code=400, detail="invalid_routing_mode") from exc
 
     explicit_speak = _parse_speak_flag(speak)
+
+    # An explicitly requested agent id that the gateway does not recognise is a
+    # real request error: return a structured 400 instead of silently ignoring
+    # it and routing somewhere else (which could otherwise surface as a null or
+    # unattributed reply). Valid HAL/TRON ids and the absence of a hint are
+    # unaffected.
+    unknown_agent = _unknown_preferred_agent(preferredAgent)
+    if unknown_agent is not None:
+        await state.connections.broadcast(
+            event(
+                "error",
+                sessionId=session_id,
+                payload={"code": "unknown_agent", "message": f"Unknown preferred agent: {unknown_agent}"},
+            )
+        )
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "code": "unknown_agent",
+                "message": f"Unknown preferred agent: {unknown_agent}",
+            },
+        )
 
     try:
         raw = await read_upload(audio, state.settings)

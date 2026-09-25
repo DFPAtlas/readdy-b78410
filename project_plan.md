@@ -218,11 +218,62 @@ When live data is added later, these become the shapes returned by the backend.
 - Note: written without live access to HAL — voice models, latency and resource usage must be verified on the machine.
 - Status: **complete** (source delivered; live verification is out of scope for this agent)
 
+### Phase 11: LIVE-mode gateway normalization + turn reconciliation
+- Goal: Make the console robustly compatible with the gateway's real wire format for BOTH LIVE text chat
+  and LIVE microphone turns, so each interaction shows exactly one user message and one assistant response.
+- Deliverable:
+  - `src/pages/console/gateway/normalize.ts` — the single normalization layer at the gateway boundary.
+    Maps gateway agent ids (`atlas-hal` / `atlas-tron`) to console ids (`hal` / `tron`) for HTTP bodies
+    **and** WebSocket events, and flattens the gateway's nested `payload` (transcript, selected agent,
+    routing, thinking, response deltas, completion, errors, agent status) into the console's flat event.
+    `POST /api/chat` responses are now accepted from `atlas-hal` / `atlas-tron` (previously required `hal`/`tron`).
+  - `src/pages/console/gateway/turns.ts` — framework-free `LiveTurnController` that matches each inbound
+    event to the active turn by session first, then request, and tracks the single user/assistant message ids.
+  - `src/pages/console/hooks/useLiveVoiceTurn.ts` — owns LIVE microphone capture, the `/api/voice` and
+    `/api/chat` requests, and turn reconciliation. Streamed `response_delta` chunks render into ONE assistant
+    message, which the final HTTP response reconciles (never a duplicate). Cancelled/interrupted turns are
+    left exactly as the operator saw them.
+  - `src/pages/console/gateway/client.ts` — all HTTP parsing and inbound events now pass through the
+    normalization layer; the gateway event router consumes turn-scoped events only when no live turn owns them.
+  - `contracts.ts` — added the real speech event types plus the `code` field and the `interrupted` chat status.
+- Preserved: DEMO mode, existing microphone capture, cancellation, handoffs and failover are unchanged.
+- Out of scope: audio playback, TTS playback acknowledgement, wake words, memory, n8n.
+- Status: **complete** (frontend compatibility fix; live gateway testing must be performed against a running gateway)
+
+### Phase 12: Unknown agent id handling on the LIVE /api/voice path
+- Goal: Give the voice path the same canonical agent-id resolution the text path already has, so an
+  unrecognised agent id can never surface as a silent `null` or an empty/unattributed reply.
+- Deliverable:
+  - `src/pages/console/gateway/client.ts` — `parseVoiceResponse` now mirrors `parseChatResponse`: a voice
+    body whose agent id is present but unrecognised throws a structured `unknown-agent` gateway error,
+    and a reply carrying text with no resolvable agent is treated as the same contract error. The
+    non-2xx mapper also translates the gateway's `unknown_agent` code.
+  - `atlas-voice-gateway/app/main.py` — the `/api/voice` route rejects an explicitly requested
+    `preferredAgent` that it does not recognise with a structured `400 {status:error, code:unknown_agent}`
+    (plus an `error` WebSocket event) instead of silently ignoring it and routing elsewhere.
+- Preserved: valid HAL/TRON routing, microphone upload, transcription, DEMO mode, existing response fields,
+  and all other API routes (`/api/chat`, `/api/speech`, `/api/transcribe`).
+- Status: **complete** (source delivered; live microphone-to-gateway testing must be performed against a running gateway)
+
+### Phase 13: Unknown preferredAgent handling on the LIVE /api/chat path
+- Goal: Bring the text path in line with the voice path: a caller-supplied but unresolvable `preferredAgent`
+  is a real request error, never silently dropped or re-routed to a different agent.
+- Deliverable:
+  - `atlas-voice-gateway/app/main.py` — the `/api/chat` route now reuses `KNOWN_AGENT_HINTS` /
+    `_unknown_preferred_agent` and rejects an unrecognised `preferredAgent` with a structured
+    `400 {status:error, code:unknown_agent}` (plus an `error` WebSocket event) **before** running the
+    routing/generation pipeline. Omitting `preferredAgent` and valid HAL/TRON hints are unaffected.
+  - `src/pages/console/gateway/client.ts` — `/api/chat` non-2xx bodies now pass through a chat-specific
+    error mapper (mirroring `voiceErrorFromBody`), so the gateway's `unknown_agent` code surfaces as the
+    typed `unknown-agent` console error instead of a generic "unreachable".
+- Preserved: requests that omit `preferredAgent`, valid HAL/TRON routing, existing successful response
+  fields, DEMO mode, and the `/api/voice` route (untouched).
+- Status: **complete** (source delivered; live gateway request testing must be performed against a running gateway)
+
 ### Next phase ideas (not started)
 - Rolling telemetry charts for GPU / RAM history
 - Keyboard shortcuts and command palette
 - Boot / reconnect sequence overlay
-- Browser microphone capture wired to `/api/voice` (replaces the frontend transcript simulation)
 - Browser playback of synthesized audio + playback acknowledgement (completes the speak half)
 - Wake words, Supabase memory, n8n tools (all behind the gateway)
 
