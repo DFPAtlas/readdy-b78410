@@ -1,0 +1,11 @@
+# Atlas Voice Gateway - test-only dependencies.
+#
+# The RAG tests mock the Atlas RAG API with httpx.MockTransport, so the LAN
+# service is NEVER required to run them.
+#
+#   python3 -m venv .venv
+#   .venv/bin/pip install -r requirements.txt -r requirements-dev.txt
+#   .venv/bin/python -m pytest tests -q
+#
+# httpx (used by the tests) already comes in via requirements.txt.
+pytest>=7.4.0

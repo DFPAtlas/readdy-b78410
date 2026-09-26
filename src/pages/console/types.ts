@@ -36,6 +36,7 @@ export type VoiceState =
   | "transcribing"
   | "routing"
   | "thinking"
+  | "preparing-voice"
   | "hal-speaking"
   | "tron-speaking"
   | "error";
@@ -45,6 +46,8 @@ export type VoiceError =
   | "microphone-unavailable"
   | "microphone-permission"
   | "microphone-missing"
+  | "microphone-muted"
+  | "microphone-silent"
   | "recording-unsupported"
   | "recording-empty"
   | "no-speech"
@@ -58,6 +61,8 @@ export const VOICE_ERROR_LABELS: Record<VoiceError, string> = {
   "microphone-unavailable": "Microphone unavailable",
   "microphone-permission": "Microphone permission denied",
   "microphone-missing": "No microphone found",
+  "microphone-muted": "Microphone is muted",
+  "microphone-silent": "Microphone received no sound",
   "recording-unsupported": "Recording not supported",
   "recording-empty": "Recording too short",
   "no-speech": "No speech detected",
@@ -73,6 +78,10 @@ export const VOICE_ERROR_HINTS: Record<VoiceError, string> = {
   "microphone-permission":
     "The browser blocked microphone access. Allow the microphone for this site, then try again.",
   "microphone-missing": "No input device is available. Connect a microphone and try again.",
+  "microphone-muted":
+    "The selected microphone is muted. Unmute it in your system sound settings, then try again.",
+  "microphone-silent":
+    "The selected microphone captured no audible sound. Check the input device and speak while the mic is held.",
   "recording-unsupported":
     "This browser cannot record audio. Try a current Chrome, Edge or Firefox build.",
   "recording-empty": "Hold the mic (or space) while you speak, then release to send.",

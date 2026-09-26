@@ -45,6 +45,7 @@ from .models import (
     VoiceResponse,
 )
 from .ollama_client import OllamaError, OllamaUnavailable
+from .rag import RagClient, RagResult, compose_tron_messages, retrieve_context
 from .router import AutoRouter
 from .sessions import SessionStore
 from .speech_text import sanitize_for_speech, truncate_for_speech
@@ -73,6 +74,16 @@ class AppContext:
         self.stt = STTService(cfg)
         self.tts = TTSService(cfg)
         self.audio_store = AudioStore(cfg.tts_audio_ttl_s)
+        # TRON-only retrieval against the Atlas RAG API (server-side; never the browser).
+        self.rag = RagClient(
+            cfg.tron_rag_api_url,
+            enabled=cfg.tron_rag_enabled,
+            limit=cfg.tron_rag_limit,
+            min_similarity=cfg.tron_rag_min_similarity,
+            timeout_s=cfg.tron_rag_timeout_s,
+            max_excerpt_chars=cfg.tron_rag_max_excerpt_chars,
+            max_total_chars=cfg.tron_rag_max_total_chars,
+        )
         # requestId -> cancellation event for an in-flight synthesis job.
         self.speech_cancels: dict[str, threading.Event] = {}
         self.started_at = time.time()
@@ -90,6 +101,18 @@ def _speech_ref(audio_id: str) -> str:
     """Gateway-relative resource path (never a public URL, never a fs path)."""
 
     return f"/api/speech/audio/{audio_id}"
+
+
+def _rag_activity_label(result: RagResult) -> str:
+    """Short, human-readable activity label for a TRON retrieval outcome."""
+
+    if result.has_evidence:
+        count = len(result.chunks)
+        suffix = "" if count == 1 else "s"
+        return f"Retrieved {count} indexed source excerpt{suffix}"
+    if result.status == "empty":
+        return "No relevant indexed matches"
+    return "Repository retrieval unavailable"
 
 
 def _iso(timestamp: float) -> str:
@@ -194,6 +217,41 @@ async def _execute_chat(
     )
 
     model = agent.model
+
+    # TRON only: retrieve indexed repository context before generation. HAL is
+    # never augmented. This is the single shared execution point, so the text
+    # path (POST /api/chat) and the voice path (POST /api/voice, which passes the
+    # transcribed text as ``message``) retrieve identically. Retrieval never
+    # raises: a failure is carried in-band so the model can distinguish
+    # "evidence unavailable" from "no relevant matches".
+    messages: list[dict] = [{"role": "user", "content": message}]
+    rag_result = await retrieve_context(state.rag, agent_id, message)
+    if rag_result is not None:
+        messages = compose_tron_messages(message, rag_result)
+        await state.connections.broadcast(
+            event(
+                "activity",
+                sessionId=session_id,
+                requestId=req.request_id,
+                agent=agent_id,
+                payload={
+                    "status": "active" if rag_result.has_evidence else "complete",
+                    "type": "rag",
+                    "label": _rag_activity_label(rag_result),
+                },
+            )
+        )
+        # Concise diagnostic only: never the transcript text and never source chunks.
+        logger.info(
+            "rag retrieval request=%s agent=%s status=%s results=%d in %dms%s",
+            req.request_id,
+            agent_id,
+            rag_result.status,
+            len(rag_result.chunks),
+            rag_result.elapsed_ms,
+            f" error={rag_result.error}" if rag_result.error else "",
+        )
+
     await state.connections.broadcast(
         event("response_started", sessionId=session_id, requestId=req.request_id, agent=agent_id, payload={"model": model})
     )
@@ -205,7 +263,7 @@ async def _execute_chat(
         async with agent.semaphore:
             agent.active_requests += 1
             try:
-                async for delta in agent.client.chat_stream(model, [{"role": "user", "content": message}]):
+                async for delta in agent.client.chat_stream(model, messages):
                     if req.cancelled:
                         break
                     chunks.append(delta)
@@ -523,6 +581,13 @@ async def lifespan(app: FastAPI):
     logger.info("Atlas Voice Gateway %s starting", __version__)
     logger.info("HAL Ollama endpoint: %s", settings.hal_ollama_url)
     logger.info("TRON Ollama endpoint: %s", settings.tron_ollama_url)
+    logger.info(
+        "TRON RAG API: %s (enabled=%s, limit=%d, minSimilarity=%.2f)",
+        settings.tron_rag_api_url or "not configured",
+        settings.tron_rag_enabled,
+        settings.tron_rag_limit,
+        settings.tron_rag_min_similarity,
+    )
     logger.info(
         "STT: enabled=%s model=%s device=%s compute=%s",
         settings.stt_enabled, settings.stt_model, settings.stt_device, settings.stt_compute_type,

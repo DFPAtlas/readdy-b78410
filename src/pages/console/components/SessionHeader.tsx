@@ -35,6 +35,7 @@ const stateTone: Record<VoiceState, string> = {
   transcribing: "text-primary-300",
   routing: "text-primary-300",
   thinking: "text-primary-300",
+  "preparing-voice": "text-primary-300",
   "hal-speaking": "text-accent-300",
   "tron-speaking": "text-secondary-300",
   error: "text-accent-300",
@@ -69,7 +70,7 @@ export default function SessionHeader({
   return (
     <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-background-300/60 bg-background-200/40 px-4 py-2.5">
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5">
-        <Meta label="Mode">
+        <Meta label="Route">
           <span className="font-label text-[11px] uppercase tracking-[0.16em] text-foreground-900">
             {modeLabel[mode]}
           </span>

@@ -104,6 +104,26 @@ export interface VoiceResponsePayload {
   selectedVoiceId: string | null;
 }
 
+/* --------------------------------------------------------- speech playback */
+
+/**
+ * Playback acknowledgement states accepted by the gateway's
+ * `POST /api/speech/{requestId}/playback`.
+ *
+ * The gateway never fabricates `speech_started` on its own — it only knows the
+ * audio is *ready*. `started`/`ended` confirm real playback; `stopped` is the
+ * confirmed cancellation mechanism that also drops the audio resource.
+ */
+export type SpeechPlaybackState = "started" | "ended" | "stopped";
+
+/** Body of `POST /api/speech/{requestId}/playback`. */
+export interface PlaybackReportPayload {
+  state: SpeechPlaybackState;
+  sessionId?: string;
+  /** Gateway agent id (`atlas-hal` / `atlas-tron`). */
+  agent?: string;
+}
+
 /* --------------------------------------------------------- WebSocket API */
 
 export type GatewayEventType =
@@ -186,8 +206,12 @@ export type GatewayErrorKind =
   | "unsupported-audio"
   | "audio-too-large"
   | "audio-too-short"
+  | "audio-conversion"
+  | "stt-failure"
+  | "stt-unavailable"
   | "no-speech"
   | "agent-busy"
+  | "speech-expired"
   | "voice-failure";
 
 export const GATEWAY_ERROR_LABELS: Record<GatewayErrorKind, string> = {
@@ -203,14 +227,18 @@ export const GATEWAY_ERROR_LABELS: Record<GatewayErrorKind, string> = {
   "unsupported-audio": "Unsupported audio",
   "audio-too-large": "Recording too large",
   "audio-too-short": "Recording too short",
+  "audio-conversion": "Audio conversion failed",
+  "stt-failure": "Speech recognition failed",
+  "stt-unavailable": "Speech recognition unavailable",
   "no-speech": "No speech detected",
   "agent-busy": "Agents busy",
+  "speech-expired": "Voice clip unavailable",
   "voice-failure": "Voice processing failed",
 };
 
 export const GATEWAY_ERROR_HINTS: Record<GatewayErrorKind, string> = {
   "not-configured":
-    "Set VITE_ATLAS_VOICE_GATEWAY_URL to enable live mode. Demo mode stays available.",
+    "Set VITE_PUBLIC_ATLAS_VOICE_GATEWAY_URL to enable live mode. Demo mode stays available.",
   unreachable:
     "The console could not reach the Atlas Voice Gateway. Check the host and try again.",
   timeout: "No response arrived inside the expected window.",
@@ -224,12 +252,20 @@ export const GATEWAY_ERROR_HINTS: Record<GatewayErrorKind, string> = {
   "unsupported-audio": "This browser produced an audio format the gateway cannot decode. Try another browser.",
   "audio-too-large": "The clip exceeded the gateway's size or duration limit. Keep recordings shorter.",
   "audio-too-short": "The clip was too short to transcribe. Hold the mic while you speak.",
+  "audio-conversion": "The gateway could not decode the uploaded audio into the format speech recognition needs.",
+  "stt-failure": "The gateway's speech-to-text step failed while processing this clip.",
+  "stt-unavailable": "Speech recognition is not available on the gateway right now.",
   "no-speech": "Nothing was recognised in the clip, so no agent was asked to respond.",
   "agent-busy": "The gateway is handling as many requests as it allows. Try again shortly.",
+  "speech-expired":
+    "The synthesized clip was no longer available when the console tried to play it. The text reply is intact.",
   "voice-failure": "The gateway could not process the voice request. No reply was fabricated.",
 };
 
 export interface GatewayErrorInfo {
   kind: GatewayErrorKind;
+  /** Safe, human-readable message — the gateway's own message when supplied. */
   message: string;
+  /** The gateway's machine-readable error code, when one was returned. */
+  code?: string;
 }

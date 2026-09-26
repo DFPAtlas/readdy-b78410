@@ -5,10 +5,12 @@ import type { ChatMessage, ConversationFilter } from "@/pages/console/types";
 interface ConversationFeedProps {
   messages: ChatMessage[];
   operatorName: string;
-  /** Current-session indicator strip rendered above the title row. */
+  /** Current-session indicator strip rendered above the toolbar. */
   sessionSlot?: ReactNode;
-  /** Compact conversation controls rendered under the title row. */
+  /** Conversation controls rendered inside the toolbar (New / Stop / Options). */
   controlsSlot?: ReactNode;
+  /** True when the console is in LIVE mode — changes the empty state only. */
+  liveMode?: boolean;
 }
 
 const filters: { id: ConversationFilter; label: string }[] = [
@@ -25,11 +27,20 @@ const activeFilterStyles: Record<ConversationFilter, string> = {
   system: "bg-background-400 text-background-950",
 };
 
+/**
+ * The dominant centre conversation panel. One slim toolbar carries the title,
+ * the sender filter and the conversation controls; the message list then reads
+ * top-to-bottom with a comfortable measure.
+ *
+ * Only the session strip and the scroll area clip their corners, so the toolbar
+ * menu can overlay the message list instead of being cut off.
+ */
 export default function ConversationFeed({
   messages,
   operatorName,
   sessionSlot,
   controlsSlot,
+  liveMode = false,
 }: ConversationFeedProps) {
   const [filter, setFilter] = useState<ConversationFilter>("all");
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -47,20 +58,20 @@ export default function ConversationFeed({
   }, [visible.length, filter, messages]);
 
   return (
-    <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-background-300/60 bg-background-100/70">
-      {sessionSlot}
+    <section className="flex min-h-0 flex-1 flex-col rounded-xl border border-background-300/60 bg-background-100/70">
+      {sessionSlot && <div className="overflow-hidden rounded-t-xl">{sessionSlot}</div>}
 
-      <div className="flex flex-wrap items-center gap-3 border-b border-background-300/60 px-4 py-3">
-        <div className="flex flex-col">
+      <div className="relative z-20 flex flex-wrap items-center gap-x-4 gap-y-2.5 border-b border-background-300/60 px-4 py-2.5">
+        <div className="flex min-w-0 items-baseline gap-2">
           <h2 className="font-heading text-sm font-semibold uppercase tracking-[0.24em] text-foreground-950">
             Conversation
           </h2>
-          <span className="font-label text-[10px] uppercase tracking-[0.18em] text-foreground-500">
-            {visible.length} entries · live transcript
+          <span className="whitespace-nowrap font-label text-[10px] uppercase tracking-[0.16em] text-foreground-500">
+            {visible.length} {visible.length === 1 ? "entry" : "entries"}
           </span>
         </div>
 
-        <div className="ml-auto flex items-center gap-1 rounded-full border border-background-300/60 bg-background-200/50 px-1 py-1">
+        <div className="flex items-center gap-1 rounded-full border border-background-300/60 bg-background-200/50 px-1 py-1">
           {filters.map((item) => (
             <button
               key={item.id}
@@ -76,44 +87,39 @@ export default function ConversationFeed({
             </button>
           ))}
         </div>
-      </div>
 
-      {controlsSlot}
+        {controlsSlot && <div className="ml-auto">{controlsSlot}</div>}
+      </div>
 
       <div
         ref={scrollRef}
-        className="console-scroll flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 py-4"
+        className="console-scroll flex min-h-0 flex-1 flex-col overflow-y-auto rounded-b-xl px-4 py-4"
       >
-        {visible.length === 0 ? (
-          <div className="flex flex-1 flex-col items-center justify-center gap-2 py-10 text-center">
-            <i className="ri-chat-3-line text-2xl text-foreground-500" />
-            <p className="text-xs text-foreground-600">
-              No entries yet. Start a new conversation or talk to an agent.
-            </p>
-          </div>
-        ) : (
-          visible.map((message) => (
-            <MessageBubble key={message.id} message={message} operatorName={operatorName} />
-          ))
-        )}
-      </div>
-
-      <div className="flex flex-wrap items-center gap-3 border-t border-background-300/60 px-4 py-2.5">
-        <span className="flex items-center gap-2 font-label text-[10px] uppercase tracking-[0.16em] text-foreground-500">
-          <span className="h-1.5 w-1.5 rounded-full bg-accent-400" />
-          HAL
-        </span>
-        <span className="flex items-center gap-2 font-label text-[10px] uppercase tracking-[0.16em] text-foreground-500">
-          <span className="h-1.5 w-1.5 rounded-full bg-secondary-400" />
-          TRON
-        </span>
-        <span className="flex items-center gap-2 font-label text-[10px] uppercase tracking-[0.16em] text-foreground-500">
-          <span className="h-1.5 w-1.5 rounded-full bg-background-500" />
-          System
-        </span>
-        <span className="ml-auto font-label text-[10px] uppercase tracking-[0.16em] text-foreground-500">
-          Clearing keeps stored memory intact
-        </span>
+        <div className="mx-auto flex w-full max-w-[860px] flex-col gap-4">
+          {visible.length === 0 ? (
+            <div className="flex flex-col items-center justify-center gap-2 py-14 text-center">
+              <span className="flex h-10 w-10 items-center justify-center rounded-full border border-background-300/60 bg-background-200/50">
+                <i
+                  className={`${
+                    liveMode ? "ri-mic-line" : "ri-chat-3-line"
+                  } text-lg text-foreground-500`}
+                />
+              </span>
+              <p className="font-heading text-[11px] font-semibold uppercase tracking-[0.18em] text-foreground-700">
+                {liveMode ? "No live messages yet" : "No entries yet"}
+              </p>
+              <p className="max-w-[360px] text-xs text-foreground-600">
+                {liveMode
+                  ? "This is a live session. Hold the mic or type a message to talk to HAL or TRON — real replies appear here."
+                  : "Start a new conversation or talk to an agent to see messages here."}
+              </p>
+            </div>
+          ) : (
+            visible.map((message) => (
+              <MessageBubble key={message.id} message={message} operatorName={operatorName} />
+            ))
+          )}
+        </div>
       </div>
     </section>
   );

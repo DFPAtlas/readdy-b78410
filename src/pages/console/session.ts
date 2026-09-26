@@ -46,6 +46,7 @@ export const VOICE_STATE_LABELS: Record<VoiceState, string> = {
   transcribing: "Transcribing...",
   routing: "Selecting agent...",
   thinking: "Thinking...",
+  "preparing-voice": "Preparing voice...",
   "hal-speaking": "HAL is speaking",
   "tron-speaking": "TRON is speaking",
   error: "Voice service unavailable",

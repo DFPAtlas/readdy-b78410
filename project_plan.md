@@ -270,6 +270,34 @@ When live data is added later, these become the shapes returned by the backend.
   fields, DEMO mode, and the `/api/voice` route (untouched).
 - Status: **complete** (source delivered; live gateway request testing must be performed against a running gateway)
 
+### Phase 14: TRON retrieval-augmented generation (RAG) over the gateway
+- Goal: Ground TRON's LIVE answers in the indexed Atlas RAG API, for BOTH typed text and
+  voice turns, entirely server-side. HAL and DEMO behaviour stay unchanged.
+- Deliverable (inside `atlas-voice-gateway/`, deployed on HAL):
+  - `app/rag.py` — a reusable, server-side `RagClient` for `POST {TRON_RAG_API_URL}/search`
+    (query + bounded `limit` + `min_similarity`, optional `repository`). It parses
+    `results[].content/repository/path/similarity` (+ optional evidence/metadata), bounds each
+    excerpt and the total context, and never raises: timeout / HTTP error / malformed body /
+    empty results all return an in-band status. Also: explicit-only repository extraction
+    (`repository:` / `repo=` / indexed slug), a grounded TRON system prompt that fences retrieved
+    text as untrusted data, and a TRON-only `retrieve_context` seam.
+  - `app/main.py` — retrieval is inserted into `_execute_chat`, the single routing + generation
+    point shared by `POST /api/chat` (text) and `POST /api/voice` (voice; transcript is the
+    query). HAL is never augmented; a `rag` activity event is emitted for visibility. Existing
+    HTTP/WebSocket contracts, streaming, cancellation, push-to-talk, playback and failover are
+    untouched.
+  - `app/config.py` + `.env.example` — `TRON_RAG_API_URL` (server-side only; empty = inert) plus
+    `TRON_RAG_ENABLED`, `TRON_RAG_LIMIT`, `TRON_RAG_MIN_SIMILARITY`, `TRON_RAG_TIMEOUT_MS`,
+    `TRON_RAG_MAX_EXCERPT_CHARS`, `TRON_RAG_MAX_TOTAL_CHARS`. The LAN URL is never a Vite variable.
+  - `tests/` (+ `requirements-dev.txt`) — mocked pytest coverage (httpx.MockTransport, no LAN
+    service) for TRON text retrieval, TRON voice retrieval, HAL bypass, empty results, API
+    failure/timeout, repository filtering and bounded context.
+- Rollback: revert the gateway changes and remove the `TRON_RAG_*` variables; nothing is migrated
+  or deleted (the index lives in the RAG service).
+- Note: written without live access to the gateway/RAG API; the end-to-end grounded answer must be
+  verified on the machine with `TRON_RAG_API_URL` set.
+- Status: **complete** (source delivered; live end-to-end verification is out of scope for this agent)
+
 ### Next phase ideas (not started)
 - Rolling telemetry charts for GPU / RAM history
 - Keyboard shortcuts and command palette

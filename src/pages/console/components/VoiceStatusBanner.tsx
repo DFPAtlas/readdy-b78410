@@ -54,6 +54,7 @@ export default function VoiceStatusBanner({
         icon="ri-cloud-off-line"
         title={gatewayError.message}
         detail="No response was generated — the console never fabricates an answer when the gateway fails."
+        codeBadge={gatewayError.code ? `code: ${gatewayError.code}` : undefined}
         actions={
           <>
             <ActionButton
@@ -127,6 +128,7 @@ interface BannerProps {
   detail: string;
   actions: ReactNode;
   extra?: ReactNode;
+  codeBadge?: string;
 }
 
 const bannerTone: Record<BannerProps["tone"], string> = {
@@ -139,7 +141,7 @@ const iconTone: Record<BannerProps["tone"], string> = {
   warn: "text-primary-300",
 };
 
-function Banner({ tone, icon, title, detail, actions, extra }: BannerProps) {
+function Banner({ tone, icon, title, detail, actions, extra, codeBadge }: BannerProps) {
   return (
     <div
       role="status"
@@ -153,6 +155,11 @@ function Banner({ tone, icon, title, detail, actions, extra }: BannerProps) {
               {title}
             </span>
             <span className="text-[11px] leading-relaxed text-foreground-600">{detail}</span>
+            {codeBadge && (
+              <span className="mt-1 inline-flex w-fit items-center rounded border border-accent-500/40 bg-accent-500/10 px-1.5 py-0.5 font-label text-[9px] uppercase tracking-[0.16em] text-accent-300">
+                {codeBadge}
+              </span>
+            )}
           </span>
         </span>
         <span className="flex flex-wrap items-center gap-2">{actions}</span>

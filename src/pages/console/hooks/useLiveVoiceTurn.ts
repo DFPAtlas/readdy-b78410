@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import type {
   ActivityEvent,
   AgentId,
@@ -13,7 +13,7 @@ import type {
 import { VOICE_ERROR_HINTS } from "@/pages/console/types";
 import { mockOperator } from "@/mocks/console";
 import { clockStamp, createSession } from "@/pages/console/session";
-import { useMicCapture } from "@/pages/console/hooks/useMicCapture";
+import { useMicCapture, type MicCaptureDiagnostics } from "@/pages/console/hooks/useMicCapture";
 import {
   MicError,
   extensionForMimeType,
@@ -21,6 +21,7 @@ import {
   type RecordedClip,
 } from "@/pages/console/audio/micRecorder";
 import { GatewayError } from "@/pages/console/gateway/client";
+import { SpeechPlayer } from "@/pages/console/audio/speechPlayer";
 import type { GatewayApi } from "@/pages/console/hooks/useVoiceGateway";
 import {
   GATEWAY_ERROR_HINTS,
@@ -45,6 +46,10 @@ export interface LiveVoiceBridge {
   getSessionId: () => string;
   getRoutingMode: () => RoutingMode;
   getSelectedAgent: () => AgentId | null;
+  /** Whether agent voice output is enabled by the operator (top-bar switch). */
+  getVoiceOutput: () => boolean;
+  /** Whether the given agent is muted in the console (suppresses playback). */
+  getAgentMuted: (agent: AgentId) => boolean;
   nextId: (prefix: string) => string;
   pushMessage: (message: ChatMessage) => void;
   patchMessage: (id: string, patch: Partial<ChatMessage>) => void;
@@ -64,6 +69,8 @@ export interface LiveVoiceBridge {
   replaceSession: (session: VoiceSession) => void;
   nameForAgent: (agent: AgentId) => string;
   raiseVoiceError: (type: VoiceError, detail: string) => void;
+  /** Clear any lingering voice error at the start of a NEW attempt. */
+  clearVoiceError: () => void;
   reportGatewayProblem: (info: GatewayErrorInfo) => void;
   scheduleContinuous: () => void;
   markBusy: (busy: boolean) => void;
@@ -80,8 +87,14 @@ export interface LiveVoiceTurnApi {
   handleEvent: (event: GatewayEvent) => boolean;
   /** Mark the streamed assistant message interrupted and close the turn. */
   interrupt: () => void;
+  /** Stop any audible reply playback and release its audio resources. */
+  stopPlayback: () => void;
   /** Abort any capture and drop the active turn (used by session cancel). */
   reset: () => void;
+  /** Live input level (0..1) while recording — drives the meter. */
+  inputLevel: number;
+  /** Live microphone diagnostics for the Developer Diagnostics panel. */
+  micDiagnostics: MicCaptureDiagnostics;
 }
 
 /**
@@ -100,6 +113,20 @@ export function useLiveVoiceTurn(bridge: LiveVoiceBridge): LiveVoiceTurnApi {
   const bridgeRef = useRef(bridge);
   // Keep the freshest bridge without re-creating every callback below.
   bridgeRef.current = bridge;
+
+  // Single reusable audio element + object-URL owner for agent speech.
+  const speechPlayerRef = useRef<SpeechPlayer | null>(null);
+  if (speechPlayerRef.current === null) speechPlayerRef.current = new SpeechPlayer();
+  // The clip currently playing (for the gateway cancellation acknowledgement).
+  const activePlaybackRef = useRef<{ requestId: string; sessionId: string; agent: AgentId } | null>(
+    null,
+  );
+  // Bumped whenever playback starts/stops so a clip fetched for an aborted turn
+  // can never begin playing after a newer attempt has taken over.
+  const playbackEpochRef = useRef(0);
+  // The gateway's real code/message for a failed synthesis, captured from the
+  // `speech_failed` event so the HTTP reconcile can report the exact reason.
+  const speechFailureRef = useRef<{ code?: string; message?: string } | null>(null);
 
   /* ------------------------------------------------------------ helpers */
 
@@ -133,6 +160,8 @@ export function useLiveVoiceTurn(bridge: LiveVoiceBridge): LiveVoiceTurnApi {
       "no-device": "microphone-missing",
       "device-error": "microphone-unavailable",
       empty: "recording-empty",
+      silent: "microphone-silent",
+      "device-muted": "microphone-muted",
       failure: "microphone-unavailable",
     };
     const kind = mapping[error.kind] ?? "microphone-unavailable";
@@ -141,6 +170,163 @@ export function useLiveVoiceTurn(bridge: LiveVoiceBridge): LiveVoiceTurnApi {
     controllerRef.current.clear();
     bridgeRef.current.raiseVoiceError(kind, error.detail || VOICE_ERROR_HINTS[kind]);
   }, []);
+
+  /* ------------------------------------------------------- speech playback */
+
+  /**
+   * Stop any audible reply and release its audio + object URL.
+   *
+   * When a clip is active the gateway is told `stopped` — its confirmed
+   * cancellation mechanism, which also drops the short-lived audio resource.
+   */
+  const stopPlayback = useCallback((acknowledge = true) => {
+    playbackEpochRef.current += 1;
+    speechPlayerRef.current?.release();
+    const active = activePlaybackRef.current;
+    activePlaybackRef.current = null;
+    if (acknowledge && active) {
+      void bridgeRef.current.getGateway().reportPlayback(active.requestId, {
+        sessionId: active.sessionId,
+        agent: active.agent === "hal" ? "atlas-hal" : "atlas-tron",
+        state: "stopped",
+      });
+    }
+  }, []);
+
+  useEffect(
+    () => () => {
+      // Unmount: release the audio element and object URL, and best-effort drop
+      // the gateway-side clip. No audio resource survives the console.
+      playbackEpochRef.current += 1;
+      speechPlayerRef.current?.release();
+      const active = activePlaybackRef.current;
+      activePlaybackRef.current = null;
+      if (active) {
+        void bridgeRef.current.getGateway().reportPlayback(active.requestId, {
+          sessionId: active.sessionId,
+          agent: active.agent === "hal" ? "atlas-hal" : "atlas-tron",
+          state: "stopped",
+        });
+      }
+    },
+    [],
+  );
+
+  /**
+   * Fetch the synthesized clip through the gateway client and play it once.
+   *
+   * "Speaking" is only set once audio is actually audible; until then the
+   * console shows the distinct "Preparing voice" state. A failure keeps the text
+   * reply and raises a specific voice-output error.
+   */
+  const startPlayback = useCallback(
+    async (
+      b: LiveVoiceBridge,
+      params: {
+        requestId: string | null;
+        sessionId: string;
+        agent: AgentId;
+        audioRef: string;
+      },
+    ) => {
+      const api = b.getGateway();
+      const epoch = ++playbackEpochRef.current;
+      const speakingState: VoiceState = params.agent === "hal" ? "hal-speaking" : "tron-speaking";
+
+      const finishIdle = () => {
+        b.setAgentSpeaking(params.agent, false);
+        b.applyVoiceState("idle");
+        b.updateSession((prev) => ({ ...prev, state: "idle", canInterrupt: false }));
+      };
+
+      b.setAgentSpeaking(params.agent, false);
+      b.applyVoiceState("preparing-voice");
+      b.updateSession((prev) => ({ ...prev, state: "preparing-voice", canInterrupt: true }));
+      b.pushEvent({
+        id: b.nextId("evt"),
+        type: "voice",
+        label: "Preparing voice",
+        detail: `${b.nameForAgent(params.agent)} · synthesizing speech`,
+        timestamp: clockStamp(),
+        status: "active",
+        agent: params.agent,
+      });
+
+      let blob: Blob;
+      try {
+        blob = await api.fetchSpeechAudio(params.audioRef);
+      } catch (failure) {
+        if (epoch !== playbackEpochRef.current) return;
+        finishIdle();
+        const detail =
+          failure instanceof GatewayError && failure.detail
+            ? failure.detail
+            : "The synthesized audio could not be downloaded.";
+        b.raiseVoiceError("synthesis-failed", detail);
+        return;
+      }
+
+      // The turn was cancelled / a newer attempt took over while we fetched.
+      if (epoch !== playbackEpochRef.current) return;
+
+      activePlaybackRef.current = {
+        requestId: params.requestId ?? "",
+        sessionId: params.sessionId,
+        agent: params.agent,
+      };
+
+      await speechPlayerRef.current?.start(blob, {
+        onStart: () => {
+          if (epoch !== playbackEpochRef.current) return;
+          b.setAgentSpeaking(params.agent, true);
+          b.applyVoiceState(speakingState);
+          b.updateSession((prev) => ({
+            ...prev,
+            state: speakingState,
+            selectedAgent: params.agent,
+            canInterrupt: true,
+          }));
+          b.pushTranscript("agent", `${b.nameForAgent(params.agent)} speaking`);
+          if (params.requestId) {
+            void api.reportPlayback(params.requestId, {
+              sessionId: params.sessionId,
+              agent: params.agent === "hal" ? "atlas-hal" : "atlas-tron",
+              state: "started",
+            });
+          }
+        },
+        onEnd: () => {
+          if (epoch !== playbackEpochRef.current) return;
+          activePlaybackRef.current = null;
+          if (params.requestId) {
+            void api.reportPlayback(params.requestId, {
+              sessionId: params.sessionId,
+              agent: params.agent === "hal" ? "atlas-hal" : "atlas-tron",
+              state: "ended",
+            });
+          }
+          finishIdle();
+          b.pushEvent({
+            id: b.nextId("evt"),
+            type: "done",
+            label: "Response complete",
+            detail: `${b.nameForAgent(params.agent)} → console`,
+            timestamp: clockStamp(),
+            status: "complete",
+            agent: params.agent,
+          });
+          b.scheduleContinuous();
+        },
+        onError: (detail) => {
+          if (epoch !== playbackEpochRef.current) return;
+          activePlaybackRef.current = null;
+          finishIdle();
+          b.raiseVoiceError("synthesis-failed", detail);
+        },
+      });
+    },
+    [],
+  );
 
   /* ------------------------------------------- finalizing a turn (HTTP) */
 
@@ -260,20 +446,76 @@ export function useLiveVoiceTurn(bridge: LiveVoiceBridge): LiveVoiceTurnApi {
       });
     }
 
-    if (selected) b.setAgentSpeaking(selected, false);
-    b.applyVoiceState("idle");
-    b.updateSession((prev) => ({ ...prev, state: "idle", canInterrupt: false }));
-    b.pushEvent({
-      id: b.nextId("evt"),
-      type: "done",
-      label: "Response complete",
-      detail: `${selected ? b.nameForAgent(selected) : "Agent"} → console`,
-      timestamp: clockStamp(),
-      status: "complete",
-      agent: selected ?? "system",
-    });
-    b.scheduleContinuous();
-  }, []);
+    // --- Voice output ---------------------------------------------------
+    // The text reply above is already reconciled and is ALWAYS kept. From here
+    // we only decide whether that reply is also spoken.
+    const voiceOutputOn = b.getVoiceOutput();
+    const muted = selected ? b.getAgentMuted(selected) : false;
+    const requestId = result.requestId ?? turn.requestId;
+    const audioRef = result.audioRef ?? null;
+
+    const finishIdle = () => {
+      if (selected) b.setAgentSpeaking(selected, false);
+      b.applyVoiceState("idle");
+      b.updateSession((prev) => ({ ...prev, state: "idle", canInterrupt: false }));
+      b.pushEvent({
+        id: b.nextId("evt"),
+        type: "done",
+        label: "Response complete",
+        detail: `${selected ? b.nameForAgent(selected) : "Agent"} → console`,
+        timestamp: clockStamp(),
+        status: "complete",
+        agent: selected ?? "system",
+      });
+      b.scheduleContinuous();
+    };
+
+    // Synthesis failure: the reply stands, only the voice output failed. The
+    // gateway's real code is included when the event supplied one.
+    if (result.speechStatus === "failed") {
+      const failure = speechFailureRef.current;
+      const codeSuffix = failure?.code ? ` (code: ${failure.code})` : "";
+      const detail = failure?.message?.trim()
+        ? `${failure.message}${codeSuffix}`
+        : `The gateway could not synthesize a voice reply${codeSuffix}.`;
+      if (selected) b.setAgentSpeaking(selected, false);
+      b.applyVoiceState("idle");
+      b.updateSession((prev) => ({ ...prev, state: "idle", canInterrupt: false }));
+      b.raiseVoiceError("synthesis-failed", detail);
+      b.scheduleContinuous();
+      return;
+    }
+
+    const producedAudio = !!selected && result.speechStatus === "synthesized" && !!audioRef;
+
+    if (producedAudio && selected && audioRef) {
+      if (!voiceOutputOn || muted) {
+        // Audio was produced but this turn must stay silent (voice output off,
+        // or the agent is muted): drop the clip instead of leaving it to expire.
+        if (requestId) {
+          void b.getGateway().reportPlayback(requestId, {
+            sessionId: result.sessionId,
+            agent: selected === "hal" ? "atlas-hal" : "atlas-tron",
+            state: "stopped",
+          });
+        }
+        finishIdle();
+        return;
+      }
+
+      // Play exactly one clip. Playback owns the idle transition + continuous
+      // scheduling, so the turn is NOT closed here.
+      void startPlayback(b, {
+        requestId,
+        sessionId: result.sessionId,
+        agent: selected,
+        audioRef,
+      });
+      return;
+    }
+
+    finishIdle();
+  }, [startPlayback]);
 
   /* ------------------------------------------------- capture lifecycle */
 
@@ -289,6 +531,13 @@ export function useLiveVoiceTurn(bridge: LiveVoiceBridge): LiveVoiceTurnApi {
     b.stopPartialReveal();
     b.clearPartialLine();
     b.clearTranscriptLines();
+    // A new attempt always silences the previous reply and clears its synthesis
+    // failure record, so nothing from the last turn leaks into this one.
+    stopPlayback();
+    speechFailureRef.current = null;
+    // A brand-new attempt owns its own status: drop the previous attempt's
+    // voice error and gateway error so a stale banner can never linger.
+    b.clearVoiceError();
     api.clearError();
 
     const sessionId = b.getSessionId();
@@ -360,9 +609,11 @@ export function useLiveVoiceTurn(bridge: LiveVoiceBridge): LiveVoiceTurnApi {
           form.append("preferredAgent", mode === "hal" ? "atlas-hal" : "atlas-tron");
         }
         form.append("language", "en");
-        // No playback in this phase: ask the gateway not to synthesize so no
-        // CPU is spent producing audio the console would only discard.
-        form.append("speak", "false");
+        // Voice output switch controls synthesis: when it is ON the gateway
+        // synthesizes the reply in the selected agent's voice (returned as a
+        // short-lived audio resource); when it is OFF we ask for text only, so
+        // no CPU is spent and no audio is ever fetched or played.
+        form.append("speak", b.getVoiceOutput() ? "true" : "false");
 
         const result = await api.sendVoice(form);
         b.updateEvent(uploadEvtId, { status: "complete" });
@@ -408,11 +659,13 @@ export function useLiveVoiceTurn(bridge: LiveVoiceBridge): LiveVoiceTurnApi {
   }, [capture, handleMicFailure, submitClip]);
 
   const reset = useCallback(() => {
+    stopPlayback();
+    speechFailureRef.current = null;
     capture.cancel();
     capturingRef.current = false;
     startPromiseRef.current = null;
     controllerRef.current.clear();
-  }, [capture]);
+  }, [capture, stopPlayback]);
 
   /* ------------------------------------------------------- text turns */
 
@@ -424,6 +677,12 @@ export function useLiveVoiceTurn(bridge: LiveVoiceBridge): LiveVoiceTurnApi {
       b.stopPartialReveal();
       b.clearPartialLine();
       b.clearTranscriptLines();
+      // A new attempt silences any reply still playing and clears the previous
+      // synthesis failure record.
+      stopPlayback();
+      speechFailureRef.current = null;
+      // Each new attempt clears the previous attempt's banners immediately.
+      b.clearVoiceError();
       api.clearError();
 
       b.applyVoiceState("routing");
@@ -602,16 +861,31 @@ export function useLiveVoiceTurn(bridge: LiveVoiceBridge): LiveVoiceTurnApi {
             status: "processing",
           });
         }
-        b.applyVoiceState(agentId === "hal" ? "hal-speaking" : "tron-speaking");
-        b.setAgentSpeaking(agentId, true);
-        b.updateSession((prev) => ({
-          ...prev,
-          selectedAgent: agentId,
-          state: agentId === "hal" ? "hal-speaking" : "tron-speaking",
-          responseStartedAt: Date.now(),
-          canInterrupt: true,
-        }));
-        b.pushTranscript("agent", `${b.nameForAgent(agentId)} speaking`);
+        if (turn.kind === "voice") {
+          // Voice turns own "speaking" through REAL audio playback: the reply
+          // text streams first with no sound, so the console shows the reply
+          // being composed until synthesized audio actually starts.
+          b.setAgentSpeaking(agentId, false);
+          b.applyVoiceState("thinking");
+          b.updateSession((prev) => ({
+            ...prev,
+            selectedAgent: agentId,
+            state: "thinking",
+            responseStartedAt: Date.now(),
+            canInterrupt: true,
+          }));
+        } else {
+          b.applyVoiceState(agentId === "hal" ? "hal-speaking" : "tron-speaking");
+          b.setAgentSpeaking(agentId, true);
+          b.updateSession((prev) => ({
+            ...prev,
+            selectedAgent: agentId,
+            state: agentId === "hal" ? "hal-speaking" : "tron-speaking",
+            responseStartedAt: Date.now(),
+            canInterrupt: true,
+          }));
+          b.pushTranscript("agent", `${b.nameForAgent(agentId)} speaking`);
+        }
         b.pushEvent({
           id: b.nextId("evt"),
           type: "generate",
@@ -642,6 +916,43 @@ export function useLiveVoiceTurn(bridge: LiveVoiceBridge): LiveVoiceTurnApi {
         if (agentId) b.setAgentSpeaking(agentId, false);
         return true;
       }
+      case "speech_synthesis_started": {
+        const agentLabel = (event.agent ?? b.getSelectedAgent() ?? "agent").toUpperCase();
+        b.applyVoiceState("preparing-voice");
+        b.updateSession((prev) => ({ ...prev, state: "preparing-voice", canInterrupt: true }));
+        b.pushTranscript("status", `${agentLabel} preparing voice...`);
+        return true;
+      }
+      case "speech_ready": {
+        // The clip is synthesized and waiting to be played. Playback is started
+        // from the HTTP response's audioRef, so the state stays "preparing".
+        b.applyVoiceState("preparing-voice");
+        return true;
+      }
+      case "speech_started": {
+        const agentId = event.agent ?? b.getSelectedAgent();
+        if (!agentId) return true;
+        b.setAgentSpeaking(agentId, true);
+        b.applyVoiceState(agentId === "hal" ? "hal-speaking" : "tron-speaking");
+        b.updateSession((prev) => ({
+          ...prev,
+          state: agentId === "hal" ? "hal-speaking" : "tron-speaking",
+          canInterrupt: true,
+        }));
+        return true;
+      }
+      case "speech_ended":
+      case "speech_cancelled": {
+        const agentId = event.agent ?? b.getSelectedAgent();
+        if (agentId) b.setAgentSpeaking(agentId, false);
+        return true;
+      }
+      case "speech_failed": {
+        // Record the gateway's real error code/message. The HTTP response owns
+        // the single user-facing message, so the failure is reported once.
+        speechFailureRef.current = { code: event.code, message: event.message };
+        return true;
+      }
       case "error": {
         // The HTTP round-trip reports the failure with a typed banner, so the
         // socket event is consumed here to avoid a duplicate message.
@@ -654,15 +965,37 @@ export function useLiveVoiceTurn(bridge: LiveVoiceBridge): LiveVoiceTurnApi {
 
   const interrupt = useCallback(() => {
     const b = bridgeRef.current;
+    stopPlayback();
     const turn = controllerRef.current.current;
     if (turn?.assistantMessageId) {
       b.patchMessage(turn.assistantMessageId, { status: "interrupted" });
     }
     controllerRef.current.finish();
-  }, []);
+  }, [stopPlayback]);
 
   return useMemo(
-    () => ({ isCapturing: () => capturingRef.current, startCapture, endCapture, sendText, handleEvent, interrupt, reset }),
-    [startCapture, endCapture, sendText, handleEvent, interrupt, reset],
+    () => ({
+      isCapturing: () => capturingRef.current,
+      startCapture,
+      endCapture,
+      sendText,
+      handleEvent,
+      interrupt,
+      stopPlayback,
+      reset,
+      inputLevel: capture.level,
+      micDiagnostics: capture.diagnostics,
+    }),
+    [
+      capture.diagnostics,
+      capture.level,
+      startCapture,
+      endCapture,
+      sendText,
+      handleEvent,
+      interrupt,
+      stopPlayback,
+      reset,
+    ],
   );
 }

@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useState } from "react";
 import StatusBadge, { type BadgeState } from "@/components/base/StatusBadge";
 import type { ActivityEvent, ActivityStatus, ActivityAgent } from "@/pages/console/types";
 
@@ -47,62 +47,102 @@ const statusBadge: Record<ActivityStatus, BadgeState> = {
   failed: "error",
 };
 
+/**
+ * Compact, expandable system activity feed. Collapsed it shows only the latest
+ * meaningful event plus the running count, so it stops competing with the voice
+ * dock; expanded it preserves the full scrollable event feed.
+ */
 export default function ActivityStrip({ events }: ActivityStripProps) {
-  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const [open, setOpen] = useState(false);
   const visible = events.slice(-14);
-
-  useEffect(() => {
-    const node = scrollRef.current;
-    if (!node) return;
-    node.scrollLeft = node.scrollWidth;
-  }, [events.length]);
+  const latest = events.length > 0 ? events[events.length - 1] : null;
 
   return (
-    <section className="border-t border-background-300/60 bg-background-200/50 px-4 py-2.5 md:px-6">
-      <div className="flex items-center gap-3">
-        <div className="flex shrink-0 items-center gap-2">
+    <section className="border-t border-background-300/60 bg-background-200/50 px-4 py-2 md:px-6">
+      <button
+        type="button"
+        onClick={() => setOpen((prev) => !prev)}
+        aria-expanded={open}
+        className="flex w-full cursor-pointer items-center gap-3 text-left"
+      >
+        <span className="flex shrink-0 items-center gap-2">
           <span className="relative flex h-2 w-2 items-center justify-center">
             <span className="absolute h-2 w-2 rounded-full bg-secondary-400 atlas-blink" />
           </span>
           <span className="font-heading text-[10px] font-semibold uppercase tracking-[0.22em] text-foreground-800">
             System activity
           </span>
-        </div>
+        </span>
 
-        <div
-          ref={scrollRef}
-          className="console-scroll flex min-w-0 flex-1 items-center gap-2 overflow-x-auto pb-0.5"
-        >
-          {visible.map((event) => (
-            <div
-              key={event.id}
-              className={`flex shrink-0 items-center gap-2 rounded-lg border px-2.5 py-1.5 ${agentTone[event.agent]} atlas-rise`}
+        <span className="flex min-w-0 flex-1 items-center gap-2">
+          {!open && latest && (
+            <span
+              className={`flex min-w-0 items-center gap-2 rounded-lg border px-2.5 py-1 ${agentTone[latest.agent]}`}
             >
               <i
-                className={`${typeIcon[event.type] ?? "ri-information-line"} text-[11px] ${
-                  kindTone[event.type] ?? "text-foreground-600"
+                className={`${typeIcon[latest.type] ?? "ri-information-line"} text-[11px] ${
+                  kindTone[latest.type] ?? "text-foreground-600"
                 }`}
               />
-              <span className="flex flex-col leading-tight">
-                <span className="whitespace-nowrap font-label text-[10px] uppercase tracking-[0.12em] text-foreground-800">
-                  {event.label}
-                </span>
-                <span className="hidden whitespace-nowrap font-label text-[9px] uppercase tracking-[0.12em] text-foreground-500 xl:block">
-                  {event.detail}
-                </span>
+              <span className="truncate font-label text-[10px] uppercase tracking-[0.12em] text-foreground-800">
+                {latest.label}
               </span>
-              <StatusBadge state={statusBadge[event.status]} showLabel={false} />
-              <span className="font-label text-[9px] tabular-nums text-foreground-500">
-                {event.timestamp}
+              <span className="hidden shrink-0 font-label text-[9px] tabular-nums text-foreground-500 sm:block">
+                {latest.timestamp}
               </span>
-            </div>
-          ))}
-        </div>
-
-        <span className="hidden shrink-0 font-label text-[10px] uppercase tracking-[0.16em] text-foreground-500 xl:block">
-          Live event feed · placeholder
+            </span>
+          )}
+          {!open && !latest && (
+            <span className="font-label text-[10px] uppercase tracking-[0.16em] text-foreground-500">
+              No events yet
+            </span>
+          )}
         </span>
-      </div>
+
+        <span className="flex shrink-0 items-center gap-2">
+          <span className="hidden font-label text-[10px] uppercase tracking-[0.16em] text-foreground-500 sm:block">
+            {events.length} events
+          </span>
+          <i
+            className={`${open ? "ri-arrow-down-s-line" : "ri-arrow-up-s-line"} text-sm text-foreground-500`}
+          />
+        </span>
+      </button>
+
+      {open && (
+        <div className="console-scroll mt-2 flex items-center gap-2 overflow-x-auto pb-0.5 atlas-rise">
+          {visible.length === 0 ? (
+            <span className="font-label text-[10px] uppercase tracking-[0.16em] text-foreground-500">
+              No events yet
+            </span>
+          ) : (
+            visible.map((event) => (
+              <div
+                key={event.id}
+                className={`flex shrink-0 items-center gap-2 rounded-lg border px-2.5 py-1.5 ${agentTone[event.agent]}`}
+              >
+                <i
+                  className={`${typeIcon[event.type] ?? "ri-information-line"} text-[11px] ${
+                    kindTone[event.type] ?? "text-foreground-600"
+                  }`}
+                />
+                <span className="flex flex-col leading-tight">
+                  <span className="whitespace-nowrap font-label text-[10px] uppercase tracking-[0.12em] text-foreground-800">
+                    {event.label}
+                  </span>
+                  <span className="hidden whitespace-nowrap font-label text-[9px] uppercase tracking-[0.12em] text-foreground-500 xl:block">
+                    {event.detail}
+                  </span>
+                </span>
+                <StatusBadge state={statusBadge[event.status]} showLabel={false} />
+                <span className="font-label text-[9px] tabular-nums text-foreground-500">
+                  {event.timestamp}
+                </span>
+              </div>
+            ))
+          )}
+        </div>
+      )}
     </section>
   );
 }

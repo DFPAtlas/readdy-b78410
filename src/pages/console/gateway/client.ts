@@ -11,6 +11,7 @@ import {
   type GatewayEventType,
   type GatewayMode,
   type GatewaySocketState,
+  type PlaybackReportPayload,
   type VoiceResponsePayload,
 } from "@/pages/console/gateway/contracts";
 import {
@@ -50,15 +51,24 @@ export class GatewayError extends Error {
 
   readonly detail: string;
 
-  constructor(kind: GatewayErrorKind, detail?: string) {
+  /** The gateway's machine-readable error code, when one was returned. */
+  readonly code?: string;
+
+  constructor(kind: GatewayErrorKind, detail?: string, code?: string) {
     super(detail ?? GATEWAY_ERROR_LABELS[kind]);
     this.name = "GatewayError";
     this.kind = kind;
     this.detail = detail ?? "";
+    this.code = code && code.trim() ? code : undefined;
   }
 
   toInfo(): GatewayErrorInfo {
-    return { kind: this.kind, message: this.detail || GATEWAY_ERROR_HINTS[this.kind] };
+    const info: GatewayErrorInfo = {
+      kind: this.kind,
+      message: this.detail || GATEWAY_ERROR_HINTS[this.kind],
+    };
+    if (this.code) info.code = this.code;
+    return info;
   }
 }
 
@@ -360,6 +370,69 @@ export class AtlasVoiceGateway {
     this.emitDiagnostics();
   }
 
+  /* ------------------------------------------------------- speech audio */
+
+  /**
+   * Download a synthesized clip from the gateway's short-lived audio resource.
+   *
+   * `audioRef` is gateway-relative (e.g. `/api/speech/audio/<id>`), so it is
+   * resolved against the configured base URL — the console never invents a host.
+   * A missing/expired clip is reported as its own typed error so the caller can
+   * keep the text reply and show a specific message.
+   */
+  async fetchSpeechAudio(audioRef: string): Promise<Blob> {
+    if (!gatewayConfig.configured) throw new GatewayError("not-configured");
+
+    const ref = audioRef.trim();
+    const url = /^https?:\/\//i.test(ref)
+      ? ref
+      : toHttpUrl(ref.startsWith("/") ? ref : `/${ref}`);
+
+    let response: Response;
+    try {
+      response = await fetch(url, { method: "GET" });
+    } catch {
+      throw new GatewayError("unreachable", "The synthesized audio could not be downloaded.");
+    }
+
+    if (!response.ok) {
+      throw new GatewayError(
+        response.status === 404 ? "speech-expired" : "voice-failure",
+        response.status === 404
+          ? GATEWAY_ERROR_HINTS["speech-expired"]
+          : `The synthesized audio could not be downloaded (HTTP ${response.status}).`,
+        `speech_audio_${response.status}`,
+      );
+    }
+
+    const blob = await response.blob();
+    if (!blob.size) {
+      throw new GatewayError(
+        "speech-expired",
+        GATEWAY_ERROR_HINTS["speech-expired"],
+        "speech_audio_empty",
+      );
+    }
+    return blob;
+  }
+
+  /**
+   * Best-effort playback acknowledgement. `started`/`ended` are informational;
+   * `stopped` is the gateway's confirmed cancellation for the clip.
+   */
+  async reportPlayback(requestId: string, payload: PlaybackReportPayload): Promise<void> {
+    if (!gatewayConfig.configured || !requestId) return;
+    try {
+      await fetch(toHttpUrl(`/api/speech/${encodeURIComponent(requestId)}/playback`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+    } catch {
+      /* acknowledgement is best-effort — local playback already happened */
+    }
+  }
+
   interruptSpeech(): void {
     this.sendSocket({ type: "interrupt", sessionId: this.sessionId });
   }
@@ -412,60 +485,88 @@ export class AtlasVoiceGateway {
     const record = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
     const code = typeof record.code === "string" ? record.code : "";
     const message = typeof record.message === "string" ? record.message : undefined;
+    const errorCode = code || undefined;
 
     switch (code) {
       case "unknown_agent":
-        return new GatewayError("unknown-agent", message);
+        return new GatewayError("unknown-agent", message, errorCode);
       case "agent_unavailable":
       case "local_ai_unavailable":
       case "agent_unreachable":
-        return new GatewayError("agent-unavailable", message);
+      case "agent_error":
+        return new GatewayError("agent-unavailable", message, errorCode);
       case "agent_busy":
       case "too_many_requests":
-        return new GatewayError("agent-busy", message);
+        return new GatewayError("agent-busy", message, errorCode);
       default:
         break;
     }
 
-    if (status === 408 || status === 504) return new GatewayError("timeout", message);
-    return new GatewayError("unreachable", message ?? `Voice Gateway responded ${status}`);
+    if (status === 408 || status === 504) return new GatewayError("timeout", message, errorCode);
+    return new GatewayError(
+      "unreachable",
+      message ?? `Voice Gateway responded ${status}`,
+      errorCode,
+    );
   }
 
-  /** Map a non-2xx `/api/voice` body to a specific, typed gateway error. */
+  /**
+   * Map a non-2xx `/api/voice` body to a specific, typed gateway error.
+   *
+   * The gateway returns `{status:"error", code, message}` on failure (see
+   * `atlas-voice-gateway/app/main.py`). Both the code and the message are
+   * carried through to the UI so a conversion failure, an STT failure and a
+   * timeout are each distinguishable — an unknown code is NEVER flattened into
+   * a generic "service unavailable".
+   */
   private voiceErrorFromBody(status: number, value: unknown): GatewayError {
     const record = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
     const code = typeof record.code === "string" ? record.code : "";
     const message = typeof record.message === "string" ? record.message : undefined;
+    const errorCode = code || undefined;
 
     switch (code) {
       case "unsupported_type":
-        return new GatewayError("unsupported-audio", message);
+      case "empty_audio":
+        return new GatewayError("unsupported-audio", message, errorCode);
       case "too_large":
       case "audio_too_long":
       case "message_too_large":
-        return new GatewayError("audio-too-large", message);
+        return new GatewayError("audio-too-large", message, errorCode);
       case "audio_too_short":
-        return new GatewayError("audio-too-short", message);
+        return new GatewayError("audio-too-short", message, errorCode);
+      case "conversion_unavailable":
+      case "conversion_failed":
+        return new GatewayError("audio-conversion", message, errorCode);
+      case "conversion_timeout":
+        return new GatewayError("timeout", message, errorCode);
+      case "stt_unavailable":
+        return new GatewayError("stt-unavailable", message, errorCode);
       case "stt_busy":
       case "agent_busy":
       case "too_many_requests":
-        return new GatewayError("agent-busy", message);
+        return new GatewayError("agent-busy", message, errorCode);
+      case "transcription_timeout":
+        return new GatewayError("timeout", message, errorCode);
+      case "transcription_failed":
+        return new GatewayError("stt-failure", message, errorCode);
       case "agent_unavailable":
       case "local_ai_unavailable":
       case "agent_unreachable":
-        return new GatewayError("agent-unavailable", message);
+      case "agent_error":
+        return new GatewayError("agent-unavailable", message, errorCode);
       case "no_speech_detected":
-        return new GatewayError("no-speech", message);
+        return new GatewayError("no-speech", message, errorCode);
       case "unknown_agent":
-        return new GatewayError("unknown-agent", message);
+        return new GatewayError("unknown-agent", message, errorCode);
       default:
         break;
     }
 
-    if (status === 415) return new GatewayError("unsupported-audio", message);
-    if (status === 413) return new GatewayError("audio-too-large", message);
-    if (status === 408 || status === 504) return new GatewayError("timeout", message);
-    return new GatewayError("voice-failure", message);
+    if (status === 415) return new GatewayError("unsupported-audio", message, errorCode);
+    if (status === 413) return new GatewayError("audio-too-large", message, errorCode);
+    if (status === 408 || status === 504) return new GatewayError("timeout", message, errorCode);
+    return new GatewayError("voice-failure", message, errorCode);
   }
 
   private handleRawEvent(data: unknown): void {

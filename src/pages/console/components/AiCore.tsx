@@ -9,7 +9,7 @@ interface AiCoreProps {
 
 const coreTheme = {
   hal: {
-    glow: "bg-accent-500/25",
+    glow: "bg-accent-500/15",
     ringOuter: "border-accent-500/35",
     ringMid: "border-accent-500/55",
     ringInner: "border-accent-300/50",
@@ -19,7 +19,7 @@ const coreTheme = {
     scan: "border-accent-500/40",
   },
   tron: {
-    glow: "bg-secondary-500/25",
+    glow: "bg-secondary-500/15",
     ringOuter: "border-secondary-500/35",
     ringMid: "border-secondary-500/55",
     ringInner: "border-secondary-300/50",

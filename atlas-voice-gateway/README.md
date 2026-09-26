@@ -57,8 +57,11 @@ tools.
 │   ├── speech_text.py     # reusable speech-text sanitizer (markdown/code/URLs)
 │   ├── tts.py             # reusable Piper TTS service (voices, cancel, limits)
 │   ├── audio_store.py     # short-lived in-memory synthesized-audio resources
+│   ├── rag.py             # TRON-only retrieval (Atlas RAG API /search client)
 │   └── main.py            # FastAPI app, routes, request flow
+├── tests/                 # mocked gateway tests (pytest; no LAN service needed)
 ├── requirements.txt
+├── requirements-dev.txt
 ├── .env.example
 └── README.md
 ```
@@ -447,6 +450,105 @@ Only the voice **filename** is shown; full model paths are never exposed.
 
 ---
 
+## 6.1 TRON retrieval-augmented generation (RAG)
+
+TRON can ground its answers in the indexed source repositories exposed by the
+**Atlas RAG API** on `atlas-tron`. This is a **gateway-side** integration only:
+the browser never calls the RAG service, and the LAN address is never shipped to
+the frontend.
+
+### Where retrieval happens in the request flow
+
+Text and voice share exactly one routing + generation pipeline, `_execute_chat`.
+Retrieval is inserted there, immediately after the agent is selected and before
+generation starts:
+
+```
+POST /api/chat   (typed message)
+POST /api/voice  (audio -> STT -> transcript)   <- same _execute_chat call
+        |
+        v
+_resolve_route -> agent = atlas-tron ?  --no-->  HAL: unchanged (user message only)
+        |                                    \--yes--> retrieve_context()
+        |                                                 |  POST /search (TRON_RAG_API_URL)
+        v                                                 v
+   messages = [system(grounded prompt + outcome), user message]
+        |
+        v
+   Ollama chat_stream -> response_delta / response_complete (unchanged contracts)
+```
+
+* **TRON only.** HAL is never augmented (its messages stay exactly
+  `[{role: user, content: <message>}]`).
+* **Voice uses the transcript.** `/api/voice` transcribes first and passes the
+  transcript to `_execute_chat`, so the search query is the spoken text.
+* **No second bubble, no new contracts.** Only the prompt changes; streaming,
+  cancellation, push-to-talk, playback and failover are untouched. One
+  `activity` event (`type: "rag"`) is emitted for visibility.
+
+### The RAG API call
+
+```
+POST {TRON_RAG_API_URL}/search
+{ "query": "...", "limit": 4, "min_similarity": 0.4, "repository": "readdy-5650b0"? }
+  -> { "results": [ { "content", "repository", "path", "similarity", "evidence", "metadata" } ] }
+```
+
+`repository` is included **only** when the user explicitly identifies one
+(`repository: readdy-5650b0`, `repo=<slug>`, or a bare indexed slug like
+`readdy-5650b0`). A generic question is searched **unfiltered** - GarageFlow (or
+any repository) is never silently assumed to be the subject.
+
+### Safety and failure handling
+
+* Retrieved text is treated as **untrusted reference material**: it is fenced
+  between `BEGIN/END RETRIEVED REFERENCE MATERIAL` markers and the system prompt
+  tells TRON to treat it as data, never instructions.
+* Each excerpt is truncated to `TRON_RAG_MAX_EXCERPT_CHARS` and the whole block
+to `TRON_RAG_MAX_TOTAL_CHARS`.
+* **Timeouts, HTTP errors, unreachable service or empty results never break the
+  turn.** The model is told the outcome explicitly so its answer can distinguish
+  "evidence unavailable" from "no relevant matches", and it is instructed never
+  to invent a repository/file citation or claim it searched when it did not.
+* Logs are metadata-only (`status`, result count, elapsed ms, error code) - the
+transcript text and source chunks are never logged.
+
+### Configuration (server-side only)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `TRON_RAG_API_URL` | *(empty)* | RAG base URL. Empty = retrieval inert (TRON behaves as before). |
+| `TRON_RAG_ENABLED` | `true` | Master switch (must also have a URL). |
+| `TRON_RAG_LIMIT` | `4` | Bounded result count per search. |
+| `TRON_RAG_MIN_SIMILARITY` | `0.4` | Similarity threshold (matches the verified call). |
+| `TRON_RAG_TIMEOUT_MS` | `4000` | Retrieval timeout before degrading to ungrounded. |
+| `TRON_RAG_MAX_EXCERPT_CHARS` | `1200` | Per-excerpt cap. |
+| `TRON_RAG_MAX_TOTAL_CHARS` | `6000` | Whole-context cap. |
+
+> These values (including the LAN URL) are read from the process environment by
+the gateway. **Do not** put the RAG URL in frontend code or in any
+`VITE_*` variable.
+
+### Rollback
+
+Revert the `rag.py` / `config.py` / `main.py` changes and remove the
+`TRON_RAG_*` variables. Nothing is stored, migrated or deleted by this
+integration - the index lives entirely in the RAG service.
+
+### Tests
+
+Mocked tests (no LAN service required) live in `tests/`:
+
+```bash
+cd atlas-voice-gateway
+.venv/bin/pip install -r requirements.txt -r requirements-dev.txt
+.venv/bin/python -m pytest tests -q
+```
+
+They cover: TRON text retrieval, TRON voice retrieval (transcript query), HAL
+bypass, empty results, API failure/timeout, repository filtering, and bounded
+context.
+
 ## 7. WebSocket events
 
 One socket, no per-agent sockets. Each event has `type` + `timestamp` and, where
@@ -465,6 +567,11 @@ omitted this phase — see batch-first note above.)
 
 **Text-to-speech additions:** `speech_synthesis_started`, `speech_ready`,
 `speech_started`, `speech_ended`, `speech_cancelled`, `speech_failed`.
+
+**Retrieval (RAG) addition:** when TRON retrieval runs, one `activity` event
+with `type: "rag"` is emitted - no dedicated new event type. Its `label` is
+`Retrieved N indexed source excerpts`, `No relevant indexed matches`, or
+`Repository retrieval unavailable`. Nothing else in the stream changes.
 
 Regarding the careful distinction between the last two pairs:
 
@@ -707,6 +814,17 @@ curl -s http://127.0.0.1:8787/health
 
 # 26. Audio resources expire (a stale ref returns 404)
 curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8787/api/speech/audio/<id>
+
+# 27. TRON RAG (requires TRON_RAG_API_URL to be set on the gateway machine)
+#     A TRON question about an indexed feature should log a `rag retrieval`
+#     line and return a grounded answer citing repository/path.
+curl -s -H 'content-type: application/json' \
+  -d '{"sessionId":"t","message":"readdy-5650b0 GarageFlow booking workflow","routingMode":"TRON"}' \
+  http://127.0.0.1:8787/api/chat
+#     A HAL question must NOT produce a `rag retrieval` log line (HAL bypass).
+curl -s -H 'content-type: application/json' \
+  -d '{"sessionId":"t","message":"check the loft switch","routingMode":"HAL"}' \
+  http://127.0.0.1:8787/api/chat
 ```
 
 Performance to record on real hardware: TTS init time, synthesis time and audio

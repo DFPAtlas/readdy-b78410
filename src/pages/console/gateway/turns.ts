@@ -45,8 +45,17 @@ export interface TurnEventRef {
 export class LiveTurnController {
   private turn: LiveTurn | null = null;
 
+  /**
+   * Request ids belonging to already-finished turns. A late WebSocket event
+   * (e.g. a stray `error` / `transcription_failed`) that arrives after a newer
+   * turn has started carries an OLD request id; matching it against the current
+   * turn would corrupt that turn's status, so such ids are rejected outright.
+   */
+  private staleRequestIds = new Set<string>();
+
   /** Begin a new turn, replacing any previous (finished or stale) one. */
   begin(id: string, kind: LiveTurnKind, sessionId: string, userMessageId: string | null): LiveTurn {
+    if (this.turn?.requestId) this.staleRequestIds.add(this.turn.requestId);
     this.turn = {
       id,
       kind,
@@ -80,6 +89,9 @@ export class LiveTurnController {
     const turn = this.turn;
     if (!turn || turn.finished) return false;
 
+    // A request id from an already-finished turn can never belong to this turn.
+    if (ref.requestId && this.staleRequestIds.has(ref.requestId)) return false;
+
     if (ref.sessionId && turn.sessionId && ref.sessionId !== turn.sessionId) return false;
 
     if (ref.requestId) {
@@ -107,7 +119,10 @@ export class LiveTurnController {
   }
 
   finish(): void {
-    if (this.turn) this.turn.finished = true;
+    if (this.turn) {
+      this.turn.finished = true;
+      if (this.turn.requestId) this.staleRequestIds.add(this.turn.requestId);
+    }
   }
 
   clear(): void {

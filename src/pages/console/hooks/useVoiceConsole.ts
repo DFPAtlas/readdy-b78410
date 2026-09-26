@@ -30,6 +30,7 @@ import { agentForText, detectIntent, intentLabel, otherAgent } from "@/pages/con
 import { VOICE_TIMINGS, clockStamp, createSession } from "@/pages/console/session";
 import { useVoiceGateway, type GatewayApi } from "@/pages/console/hooks/useVoiceGateway";
 import { useLiveVoiceTurn } from "@/pages/console/hooks/useLiveVoiceTurn";
+import type { MicCaptureDiagnostics } from "@/pages/console/hooks/useMicCapture";
 import { gatewayConfig } from "@/pages/console/gateway/config";
 import {
   GATEWAY_ERROR_HINTS,
@@ -83,8 +84,16 @@ export interface VoiceConsoleApi {
   dismissError: () => void;
   simulateError: (error: VoiceError) => void;
 
+  /** Live microphone input level (0..1) while recording — drives the meter. */
+  inputLevel: number;
+  /** Live microphone diagnostics (safe metadata only, no raw audio). */
+  micDiagnostics: MicCaptureDiagnostics;
+
   voiceGatewayOnline: boolean;
   toggleVoiceGateway: () => void;
+  /** Master switch: whether agent replies are spoken aloud. */
+  voiceOutput: boolean;
+  toggleVoiceOutput: () => void;
   setAgentAvailable: (agent: AgentId, available: boolean) => void;
 
   toggleContinuous: () => void;
@@ -132,6 +141,8 @@ export function useVoiceConsole(): VoiceConsoleApi {
   const [failover, setFailover] = useState<FailoverState | null>(null);
   const [voiceError, setVoiceError] = useState<VoiceError | null>(null);
   const [voiceGatewayOnline, setVoiceGatewayOnline] = useState(true);
+  /** Master switch: whether agent replies are spoken aloud (Voice output). */
+  const [voiceOutput, setVoiceOutput] = useState(true);
 
   const gateway = useVoiceGateway();
   const gatewayApiRef = useRef(gateway);
@@ -159,6 +170,7 @@ export function useVoiceConsole(): VoiceConsoleApi {
   const continuousRef = useRef(false);
   const gatewayRef = useRef(true);
   const speakingRef = useRef<AgentId | null>(null);
+  const voiceOutputRef = useRef(true);
 
   useEffect(() => {
     agentsRef.current = agents;
@@ -175,6 +187,10 @@ export function useVoiceConsole(): VoiceConsoleApi {
   useEffect(() => {
     sessionStateRef.current = session;
   }, [session]);
+
+  useEffect(() => {
+    voiceOutputRef.current = voiceOutput;
+  }, [voiceOutput]);
 
   /* ---------------------------------------------------------------- helpers */
 
@@ -395,6 +411,16 @@ export function useVoiceConsole(): VoiceConsoleApi {
     ],
   );
 
+  /**
+   * Clear any lingering voice error at the start of a NEW attempt. Only the
+   * error fields are reset — the caller sets the new state immediately after,
+   * so this never disturbs the DEMO flow.
+   */
+  const clearVoiceError = useCallback(() => {
+    setVoiceError(null);
+    setSession((prev) => (prev.error ? { ...prev, error: null } : prev));
+  }, []);
+
   /* ---------------------------------------------- live gateway voice turns */
 
   /**
@@ -407,6 +433,8 @@ export function useVoiceConsole(): VoiceConsoleApi {
     getSessionId: () => gatewayApiRef.current.sessionId,
     getRoutingMode: () => routingModeRef.current,
     getSelectedAgent: () => sessionStateRef.current.selectedAgent,
+    getVoiceOutput: () => voiceOutputRef.current,
+    getAgentMuted: (agent) => agentsRef.current[agent]?.isMuted ?? false,
     nextId,
     pushMessage,
     patchMessage,
@@ -431,6 +459,7 @@ export function useVoiceConsole(): VoiceConsoleApi {
     replaceSession: (next) => setSession(next),
     nameForAgent,
     raiseVoiceError,
+    clearVoiceError,
     reportGatewayProblem,
     scheduleContinuous: () => scheduleContinuousRef.current(),
     markBusy: (nextBusy) => {
@@ -1553,6 +1582,23 @@ export function useVoiceConsole(): VoiceConsoleApi {
     busyRef.current = false;
   }, [applyVoiceState, pushTranscript]);
 
+  const toggleVoiceOutput = useCallback(() => {
+    const next = !voiceOutputRef.current;
+    voiceOutputRef.current = next;
+    setVoiceOutput(next);
+    pushEvent({
+      id: nextId("evt"),
+      type: "voice",
+      label: `Voice output ${next ? "enabled" : "disabled"}`,
+      detail: next
+        ? "Agent replies are spoken through the browser"
+        : "Agent replies are text-only — no synthesis requested",
+      timestamp: clockStamp(),
+      status: "complete",
+      agent: "system",
+    });
+  }, [nextId, pushEvent]);
+
   /* -------------------------------------------------------- console actions */
 
   const setRoutingMode = useCallback((mode: RoutingMode) => {
@@ -1694,6 +1740,7 @@ export function useVoiceConsole(): VoiceConsoleApi {
     stopPartialReveal();
     clearPartialLine();
     clearAllSpeaking();
+    if (modeRef.current === "live") live.stopPlayback();
     busyRef.current = false;
     setMessages([]);
     clearTranscriptLines();
@@ -1726,6 +1773,7 @@ export function useVoiceConsole(): VoiceConsoleApi {
     clearPartialLine,
     clearTimers,
     clearTranscriptLines,
+    live,
     nextId,
     pushEvent,
     pushMessage,
@@ -1873,8 +1921,12 @@ export function useVoiceConsole(): VoiceConsoleApi {
     retryVoice,
     dismissError,
     simulateError,
+    inputLevel: live.inputLevel,
+    micDiagnostics: live.micDiagnostics,
     voiceGatewayOnline,
     toggleVoiceGateway,
+    voiceOutput,
+    toggleVoiceOutput,
     setAgentAvailable,
     toggleContinuous,
     newConversation,

@@ -106,6 +106,17 @@ class Settings:
     tts_max_concurrency: int
     tts_audio_ttl_s: int
 
+    # --- TRON retrieval-augmented generation (RAG) --------------------------
+    # Server-side only. The base URL is never exposed to the browser and is never
+    # a Vite variable. Empty URL => retrieval is inert (TRON behaves as before).
+    tron_rag_api_url: str
+    tron_rag_enabled: bool
+    tron_rag_limit: int
+    tron_rag_min_similarity: float
+    tron_rag_timeout_ms: int
+    tron_rag_max_excerpt_chars: int
+    tron_rag_max_total_chars: int
+
     @property
     def request_timeout_s(self) -> float:
         return self.request_timeout_ms / 1000.0
@@ -125,6 +136,10 @@ class Settings:
     @property
     def tts_timeout_s(self) -> float:
         return self.tts_timeout_ms / 1000.0
+
+    @property
+    def tron_rag_timeout_s(self) -> float:
+        return self.tron_rag_timeout_ms / 1000.0
 
     @property
     def stt_max_upload_bytes(self) -> int:
@@ -193,4 +208,13 @@ def load_settings() -> Settings:
         tts_timeout_ms=_env_int("TTS_TIMEOUT_MS", 20_000),
         tts_max_concurrency=_env_int("TTS_MAX_CONCURRENCY", 1),
         tts_audio_ttl_s=_env_int("TTS_AUDIO_TTL_S", 30),
+        # TRON RAG settings (server-side only; empty URL means retrieval is inert)
+        tron_rag_api_url=_env_str("TRON_RAG_API_URL", "").rstrip("/"),
+        tron_rag_enabled=_env_bool("TRON_RAG_ENABLED", True),
+        tron_rag_limit=_env_int("TRON_RAG_LIMIT", 4),
+        # 0.4 matches the verified /search call on atlas-tron.
+        tron_rag_min_similarity=_env_float("TRON_RAG_MIN_SIMILARITY", 0.4),
+        tron_rag_timeout_ms=_env_int("TRON_RAG_TIMEOUT_MS", 4_000),
+        tron_rag_max_excerpt_chars=_env_int("TRON_RAG_MAX_EXCERPT_CHARS", 1_200),
+        tron_rag_max_total_chars=_env_int("TRON_RAG_MAX_TOTAL_CHARS", 6_000),
     )

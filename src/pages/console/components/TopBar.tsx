@@ -3,11 +3,17 @@ import StatusBadge from "@/components/base/StatusBadge";
 import DiagnosticsPanel from "@/pages/console/components/DiagnosticsPanel";
 import { GATEWAY_MODE_LABELS } from "@/pages/console/gateway/contracts";
 import type { GatewayApi } from "@/pages/console/hooks/useVoiceGateway";
+import type { MicCaptureDiagnostics } from "@/pages/console/hooks/useMicCapture";
 import type { Agent, AgentId } from "@/pages/console/types";
 
 interface TopBarProps {
   agents: Record<AgentId, Agent>;
   gateway: GatewayApi;
+  /** Live microphone diagnostics for the developer diagnostics panel. */
+  mic?: MicCaptureDiagnostics;
+  /** Master voice-output switch — drives whether LIVE replies are synthesized. */
+  voiceOutput: boolean;
+  onToggleVoiceOutput: () => void;
 }
 
 interface SettingRow {
@@ -24,21 +30,8 @@ const settingRows: SettingRow[] = [
 
 const pad = (value: number) => value.toString().padStart(2, "0");
 
-const modeChipTone = {
-  live: "border-secondary-500/35 bg-secondary-500/10 text-secondary-300",
-  demo: "border-primary-500/30 bg-primary-500/10 text-primary-300",
-  offline: "border-accent-500/35 bg-accent-500/10 text-accent-300",
-} as const;
-
-const modeChipIcon = {
-  live: "ri-broadcast-line",
-  demo: "ri-flask-line",
-  offline: "ri-cloud-off-line",
-} as const;
-
-export default function TopBar({ agents, gateway }: TopBarProps) {
+export default function TopBar({ agents, gateway, mic, voiceOutput, onToggleVoiceOutput }: TopBarProps) {
   const [now, setNow] = useState(() => new Date());
-  const [ping, setPing] = useState(34);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [toggles, setToggles] = useState<Record<SettingRow["id"], boolean>>({
     voice: true,
@@ -53,13 +46,6 @@ export default function TopBar({ agents, gateway }: TopBarProps) {
   }, []);
 
   useEffect(() => {
-    const id = window.setInterval(() => {
-      setPing(28 + Math.floor(Math.random() * 14));
-    }, 5000);
-    return () => window.clearInterval(id);
-  }, []);
-
-  useEffect(() => {
     const onDown = (event: MouseEvent) => {
       if (panelRef.current && !panelRef.current.contains(event.target as Node)) {
         setSettingsOpen(false);
@@ -70,10 +56,9 @@ export default function TopBar({ agents, gateway }: TopBarProps) {
   }, []);
 
   const agentList = Object.values(agents);
-  const readyCount = agentList.filter(
+  const allOnline = agentList.every(
     (agent) => agent.status === "online" || agent.status === "busy",
-  ).length;
-  const allOnline = readyCount === agentList.length;
+  );
 
   const timeLabel = `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
   const dateLabel = now
@@ -102,36 +87,19 @@ export default function TopBar({ agents, gateway }: TopBarProps) {
           </div>
         </div>
 
-        <div className="ml-auto hidden items-center gap-2 xl:flex">
-          <div
-            className={`flex items-center gap-1.5 rounded-lg border px-3 py-1.5 ${modeChipTone[gateway.mode]}`}
-          >
-            <i className={`${modeChipIcon[gateway.mode]} text-xs`} />
-            <span className="font-label text-[11px] uppercase tracking-[0.18em]">
-              {GATEWAY_MODE_LABELS[gateway.mode]}
-            </span>
+        <div className="ml-auto flex items-center gap-2 md:gap-3">
+          <div className="rounded-lg border border-secondary-500/30 bg-secondary-500/10 px-2.5 py-1.5">
+            <StatusBadge
+              state={allOnline ? "online" : "degraded"}
+              label={allOnline ? "System online" : "System degraded"}
+            />
           </div>
-          <div className="rounded-lg border border-secondary-500/30 bg-secondary-500/10 px-3 py-1.5">
-            <StatusBadge state={allOnline ? "online" : "degraded"} label={allOnline ? "System online" : "System degraded"} />
-          </div>
-          <div className="flex items-center gap-2 rounded-lg border border-background-300/70 bg-background-200/60 px-3 py-1.5">
-            <i className="ri-cpu-line text-xs text-primary-400" />
-            <span className="font-label text-[11px] uppercase tracking-[0.18em] text-foreground-700">
-              Local AI · {readyCount}/{agentList.length} online
-            </span>
-          </div>
-        </div>
 
-        <div className="ml-auto flex items-center gap-3 xl:ml-0">
           <div className="hidden flex-col items-end sm:flex">
             <span className="font-label text-sm tabular-nums text-foreground-900">{timeLabel}</span>
             <span className="font-label text-[10px] uppercase tracking-[0.18em] text-foreground-500">
               {dateLabel}
             </span>
-          </div>
-
-          <div className="flex items-center gap-2 rounded-lg border border-secondary-500/30 bg-secondary-500/10 px-2.5 py-1.5">
-            <StatusBadge state="connected" label={`Link ${ping}ms`} />
           </div>
 
           <div className="relative" ref={panelRef}>
@@ -160,30 +128,36 @@ export default function TopBar({ agents, gateway }: TopBarProps) {
                   </span>
                 </div>
                 <div className="flex flex-col gap-2">
-                  {settingRows.map((row) => (
-                    <button
-                      key={row.id}
-                      type="button"
-                      onClick={() => setToggles((prev) => ({ ...prev, [row.id]: !prev[row.id] }))}
-                      className="flex cursor-pointer items-center justify-between gap-3 rounded-lg border border-background-300/60 bg-background-200/50 px-3 py-2.5 text-left transition-colors hover:border-primary-500/40"
-                    >
-                      <span className="flex flex-col">
-                        <span className="text-xs font-medium text-foreground-900">{row.label}</span>
-                        <span className="text-[11px] text-foreground-500">{row.hint}</span>
-                      </span>
-                      <span
-                        className={`relative h-4 w-8 shrink-0 rounded-full transition-colors ${
-                          toggles[row.id] ? "bg-primary-500" : "bg-background-400"
-                        }`}
+                  {settingRows.map((row) => {
+                    const isOn = row.id === "voice" ? voiceOutput : toggles[row.id];
+                    return (
+                      <button
+                        key={row.id}
+                        type="button"
+                        onClick={() => {
+                          if (row.id === "voice") onToggleVoiceOutput();
+                          else setToggles((prev) => ({ ...prev, [row.id]: !prev[row.id] }));
+                        }}
+                        className="flex cursor-pointer items-center justify-between gap-3 rounded-lg border border-background-300/60 bg-background-200/50 px-3 py-2.5 text-left transition-colors hover:border-primary-500/40"
                       >
+                        <span className="flex flex-col">
+                          <span className="text-xs font-medium text-foreground-900">{row.label}</span>
+                          <span className="text-[11px] text-foreground-500">{row.hint}</span>
+                        </span>
                         <span
-                          className={`absolute top-0.5 h-3 w-3 rounded-full bg-background-950 transition-all ${
-                            toggles[row.id] ? "left-4" : "left-0.5"
+                          className={`relative h-4 w-8 shrink-0 rounded-full transition-colors ${
+                            isOn ? "bg-primary-500" : "bg-background-400"
                           }`}
-                        />
-                      </span>
-                    </button>
-                  ))}
+                        >
+                          <span
+                            className={`absolute top-0.5 h-3 w-3 rounded-full bg-background-950 transition-all ${
+                              isOn ? "left-4" : "left-0.5"
+                            }`}
+                          />
+                        </span>
+                      </button>
+                    );
+                  })}
                 </div>
                 <div className="mt-3 border-t border-background-300/60 pt-3">
                   <div className="mb-2 flex items-center justify-between">
@@ -233,29 +207,13 @@ export default function TopBar({ agents, gateway }: TopBarProps) {
                   </p>
                 </div>
 
-                <DiagnosticsPanel diagnostics={gateway.diagnostics} configured={gateway.configured} />
+                <DiagnosticsPanel diagnostics={gateway.diagnostics} configured={gateway.configured} mic={mic} />
               </div>
             )}
           </div>
         </div>
       </div>
 
-      <div className="flex items-center gap-2 overflow-x-auto px-4 pb-2 xl:hidden md:px-6">
-        <div className="shrink-0 rounded-lg border border-secondary-500/30 bg-secondary-500/10 px-3 py-1">
-          <StatusBadge state={allOnline ? "online" : "degraded"} label={allOnline ? "System online" : "System degraded"} />
-        </div>
-        <div className="flex shrink-0 items-center gap-2 rounded-lg border border-background-300/70 bg-background-200/60 px-3 py-1">
-          <i className="ri-cpu-line text-xs text-primary-400" />
-          <span className="font-label whitespace-nowrap text-[10px] uppercase tracking-[0.16em] text-foreground-700">
-            Local AI · {readyCount}/{agentList.length} online
-          </span>
-        </div>
-        <div className="flex shrink-0 items-center gap-2 rounded-lg border border-background-300/70 bg-background-200/60 px-3 py-1 sm:hidden">
-          <span className="font-label whitespace-nowrap text-[10px] tabular-nums uppercase tracking-[0.16em] text-foreground-700">
-            {timeLabel}
-          </span>
-        </div>
-      </div>
     </header>
   );
 }

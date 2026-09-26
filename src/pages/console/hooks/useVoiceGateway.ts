@@ -11,6 +11,7 @@ import {
   type GatewayEvent,
   type GatewayMode,
   type GatewayPreference,
+  type PlaybackReportPayload,
   type VoiceResponsePayload,
 } from "@/pages/console/gateway/contracts";
 import type { AgentId, RoutingMode } from "@/pages/console/types";
@@ -46,6 +47,8 @@ export interface GatewayApi {
     preferredAgent: AgentId | null,
   ) => Promise<ChatResponsePayload>;
   sendVoice: (form: FormData) => Promise<VoiceResponsePayload>;
+  fetchSpeechAudio: (audioRef: string) => Promise<Blob>;
+  reportPlayback: (requestId: string, payload: PlaybackReportPayload) => Promise<void>;
   cancelRequest: () => void;
   interruptSpeech: () => void;
   pushRoutingMode: (mode: RoutingMode) => void;
@@ -239,6 +242,21 @@ export function useVoiceGateway(): GatewayApi {
     }
   }, []);
 
+  const fetchSpeechAudio = useCallback(async (audioRef: string): Promise<Blob> => {
+    const client = clientRef.current;
+    if (!client || !gatewayConfig.configured) throw new GatewayError("not-configured");
+    return client.fetchSpeechAudio(audioRef);
+  }, []);
+
+  const reportPlayback = useCallback(
+    async (requestId: string, payload: PlaybackReportPayload): Promise<void> => {
+      const client = clientRef.current;
+      if (!client) return;
+      await client.reportPlayback(requestId, payload);
+    },
+    [],
+  );
+
   const cancelRequest = useCallback(() => {
     clientRef.current?.cancelRequest();
   }, []);
@@ -304,6 +322,8 @@ export function useVoiceGateway(): GatewayApi {
     sendChat,
     sendTranscript,
     sendVoice,
+    fetchSpeechAudio,
+    reportPlayback,
     cancelRequest,
     interruptSpeech,
     pushRoutingMode,

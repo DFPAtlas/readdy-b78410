@@ -3,6 +3,11 @@ import type { TranscriptLine } from "@/pages/console/types";
 interface LiveTranscriptProps {
   lines: TranscriptLine[];
   className?: string;
+  /**
+   * True only when the lines genuinely come from the local simulation. In LIVE
+   * mode the lines are real gateway frames, so the SIMULATED tag is hidden.
+   */
+  simulated?: boolean;
 }
 
 const kindIcon: Record<TranscriptLine["kind"], string> = {
@@ -26,7 +31,11 @@ const kindText: Record<TranscriptLine["kind"], string> = {
  * lines read solid, and system status lines stay small and muted — so the three
  * kinds are distinguishable at a glance.
  */
-export default function LiveTranscript({ lines, className = "" }: LiveTranscriptProps) {
+export default function LiveTranscript({
+  lines,
+  className = "",
+  simulated = false,
+}: LiveTranscriptProps) {
   const visible = lines.slice(-3);
 
   return (
@@ -43,7 +52,7 @@ export default function LiveTranscript({ lines, className = "" }: LiveTranscript
           Live transcript
         </span>
         <span className="ml-auto hidden font-label text-[10px] uppercase tracking-[0.16em] text-foreground-500 sm:block">
-          simulated
+          {simulated ? "simulated" : "gateway"}
         </span>
       </div>
 
