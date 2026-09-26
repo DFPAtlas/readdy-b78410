@@ -84,6 +84,9 @@ class AppContext:
             max_excerpt_chars=cfg.tron_rag_max_excerpt_chars,
             max_total_chars=cfg.tron_rag_max_total_chars,
             max_queries=cfg.tron_rag_max_queries,
+            repos_path=cfg.tron_rag_repos_path,
+            repos_cache_ms=cfg.tron_rag_repos_cache_ms,
+            repos_timeout_s=cfg.tron_rag_repos_timeout_s,
         )
         # requestId -> cancellation event for an in-flight synthesis job.
         self.speech_cancels: dict[str, threading.Event] = {}
@@ -244,11 +247,13 @@ async def _execute_chat(
         )
         # Concise diagnostic only: never the transcript text and never source chunks.
         logger.info(
-            "rag retrieval request=%s agent=%s status=%s results=%d in %dms%s",
+            "rag retrieval request=%s agent=%s status=%s results=%d repository=%s reason=%s in %dms%s",
             req.request_id,
             agent_id,
             rag_result.status,
             len(rag_result.chunks),
+            rag_result.repository or "-",
+            rag_result.repo_reason or "-",
             rag_result.elapsed_ms,
             f" error={rag_result.error}" if rag_result.error else "",
         )

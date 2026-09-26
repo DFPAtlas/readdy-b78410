@@ -117,6 +117,10 @@ class Settings:
     tron_rag_max_excerpt_chars: int
     tron_rag_max_total_chars: int
     tron_rag_max_queries: int
+    # Repository catalogue (GET /repos) used to resolve spoken project names.
+    tron_rag_repos_path: str
+    tron_rag_repos_cache_ms: int
+    tron_rag_repos_timeout_ms: int
 
     @property
     def request_timeout_s(self) -> float:
@@ -141,6 +145,10 @@ class Settings:
     @property
     def tron_rag_timeout_s(self) -> float:
         return self.tron_rag_timeout_ms / 1000.0
+
+    @property
+    def tron_rag_repos_timeout_s(self) -> float:
+        return self.tron_rag_repos_timeout_ms / 1000.0
 
     @property
     def stt_max_upload_bytes(self) -> int:
@@ -221,4 +229,11 @@ def load_settings() -> Settings:
         # Complementary queries per turn (cleaned query + at most one concise
         # topic query). Bounds both request count and total retrieval time.
         tron_rag_max_queries=_env_int("TRON_RAG_MAX_QUERIES", 2),
+        # Repository catalogue (GET /repos) for spoken project-name resolution.
+        # Cached briefly so a conversation does not hammer the catalogue endpoint;
+        # the fetch has its own bounded timeout and a failure degrades to the
+        # unfiltered search rather than breaking the turn.
+        tron_rag_repos_path=_env_str("TRON_RAG_REPOS_PATH", "/repos"),
+        tron_rag_repos_cache_ms=_env_int("TRON_RAG_REPOS_CACHE_MS", 60_000),
+        tron_rag_repos_timeout_ms=_env_int("TRON_RAG_REPOS_TIMEOUT_MS", 2_000),
     )

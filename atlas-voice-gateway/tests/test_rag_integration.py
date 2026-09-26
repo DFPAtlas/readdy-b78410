@@ -390,3 +390,91 @@ def test_duplicate_chunk_from_both_queries_is_cited_once():
 
     prompt = tron.received[0][0]["content"]
     assert prompt.count("source=readdy-5650b0:src/data/helpArticles.ts") == 1
+
+
+# ------------------------------------ natural project-name -> repository (GET /repos)
+
+
+def _garageflow_catalogue_handler(searches: list[dict]):
+    """GET /repos advertises GarageFlow; POST /search only answers for its slug."""
+
+    catalogue = {
+        "repos": [
+            {
+                "repository": "readdy-5650b0",
+                "metadata": {
+                    "website_name": "GarageFlow",
+                    "canonical_project_name": "GarageFlow",
+                    "readdy_project_name": "readdy-5650b0",
+                },
+            }
+        ]
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=catalogue)
+        body = json.loads(request.content)
+        searches.append(body)
+        if body.get("repository") == "readdy-5650b0":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "content": "GarageFlow workshop booking: create, confirm, then invoice.",
+                            "repository": "readdy-5650b0",
+                            "path": "src/data/helpArticles.ts",
+                            "similarity": 0.83,
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(200, json={"results": []})
+
+    return handler
+
+
+def test_natural_garageflow_typed_question_resolves_repository_and_cites():
+    searches: list[dict] = []
+    state, hal, tron = _make_state(_rag(_garageflow_catalogue_handler(searches)))
+
+    status, _ = asyncio.run(
+        _execute_chat(state, "s1", "Tell me how GarageFlow makes a booking", RoutingMode.TRON)
+    )
+
+    assert status == 200
+    # A spoken/typed sense of the project name resolved to its indexed slug and
+    # filtered the search - the speaker never had to pronounce the slug.
+    assert searches and searches[0]["repository"] == "readdy-5650b0"
+    assert "readdy-5650b0" not in searches[0]["query"]
+    # A real, supporting citation reached the grounded prompt.
+    assert "readdy-5650b0:src/data/helpArticles.ts" in tron.received[0][0]["content"]
+
+
+def test_natural_garageflow_voice_transcript_uses_same_resolution():
+    # /api/voice transcribes then calls this SAME function with the transcript as
+    # the message; the STT spacing variant "Garage Flow" must resolve identically.
+    searches: list[dict] = []
+    state, hal, tron = _make_state(_rag(_garageflow_catalogue_handler(searches)))
+
+    status, _ = asyncio.run(
+        _execute_chat(state, "s2", "Tell me how Garage Flow makes a booking", RoutingMode.TRON)
+    )
+
+    assert status == 200
+    assert searches and searches[0]["repository"] == "readdy-5650b0"
+    assert "readdy-5650b0:src/data/helpArticles.ts" in tron.received[0][0]["content"]
+
+
+def test_natural_question_without_a_project_name_stays_unfiltered():
+    searches: list[dict] = []
+    state, hal, tron = _make_state(_rag(_garageflow_catalogue_handler(searches)))
+
+    status, _ = asyncio.run(
+        _execute_chat(state, "s1", "how does the booking workflow work", RoutingMode.TRON)
+    )
+
+    assert status == 200
+    assert searches, "retrieval should still run"
+    assert all("repository" not in body for body in searches)

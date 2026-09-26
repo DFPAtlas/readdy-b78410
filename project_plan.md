@@ -323,6 +323,34 @@ When live data is added later, these become the shapes returned by the backend.
 - Note: tests are mocked; live relevance against the running RAG API must be confirmed on the machine.
 - Status: **complete** (source delivered; live verification is out of scope for this agent)
 
+### Phase 16: TRON RAG repository name resolution (spoken project names)
+- Goal: Let a speaker name a project naturally ("GarageFlow", or the STT spacing variant "Garage Flow")
+  and have TRON retrieve from the correct indexed repository - without ever pronouncing a Readdy slug.
+- Deliverable (inside `atlas-voice-gateway/`, repository code only):
+  - `app/rag.py` - a cached `GET {TRON_RAG_API_URL}/repos` catalogue (`RagClient._get_catalogue` /
+    `_fetch_catalogue`, defensive parsing of the response envelope and per-entry identifier/name keys,
+    no hardcoded names), a normalised alias index (`build_repo_catalogue` / `_RepoCatalogue.resolve`,
+    lowercased alphanumerics so "Garage Flow" matches "GarageFlow"), and `RagClient.resolve_repository`
+    with priority **explicit reference > unique project name > none**. Ambiguous or unknown names return
+    no filter (unfiltered search, no repository claimed). `retrieve_context` threads the resolved slug into
+    the existing v20 `search_multi` (complementary queries, dedup, ranking, attribution, context bounds all
+    preserved); `RagResult.repo_reason` carries the resolution reason for metadata-only logs.
+  - `app/config.py` + `.env.example` - `TRON_RAG_REPOS_PATH` (default `/repos`),
+    `TRON_RAG_REPOS_CACHE_MS` (default 60000) and `TRON_RAG_REPOS_TIMEOUT_MS` (default 2000).
+  - `app/main.py` - passes the catalogue settings into `RagClient`; the `rag retrieval` log line now
+    includes `repository=... reason=...` (metadata only, never the transcript or source chunks).
+  - `tests/` - mocked coverage (httpx.MockTransport, no LAN service) for unique project name, STT spacing
+    variant, explicit-slug precedence, ambiguous name, unknown name, missing catalogue, cache/expiry, and
+    the natural GarageFlow booking question on both the typed and voice paths.
+- Preserved: the explicit-only filter, the TRON-only server-side seam, HAL/DEMO behaviour, all HTTP/WS
+  contracts, TTS/streaming/cancellation, and the v20 relevance logic. No frontend changes; the catalogue
+  and LAN URL are never sent to the browser.
+- Rollback: revert this phase's `rag.py` / `config.py` / `main.py` / `.env.example` / docs / test changes;
+  v20 behaviour is restored. Nothing is migrated or deleted (the index lives in the RAG service).
+- Note: tests are mocked; live resolution against the running RAG API and its real `/repos` shape must be
+  confirmed on the machine.
+- Status: **complete** (source delivered; live verification is out of scope for this agent)
+
 ### Next phase ideas (not started)
 - Rolling telemetry charts for GPU / RAM history
 - Keyboard shortcuts and command palette

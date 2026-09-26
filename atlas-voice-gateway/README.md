@@ -489,15 +489,45 @@ _resolve_route -> agent = atlas-tron ?  --no-->  HAL: unchanged (user message on
 ### The RAG API call
 
 ```
+GET  {TRON_RAG_API_URL}/repos
+  -> indexed repository catalogue (name metadata per repository)
+
 POST {TRON_RAG_API_URL}/search
 { "query": "...", "limit": 4, "min_similarity": 0.4, "repository": "readdy-5650b0"? }
   -> { "results": [ { "content", "repository", "path", "similarity", "evidence", "metadata" } ] }
 ```
 
-`repository` is included **only** when the user explicitly identifies one
+`repository` is included **only** when one is identified - either explicitly
 (`repository: readdy-5650b0`, `repo=<slug>`, or a bare indexed slug like
-`readdy-5650b0`). A generic question is searched **unfiltered** - GarageFlow (or
-any repository) is never silently assumed to be the subject.
+`readdy-5650b0`) or by resolving a project name via the catalogue (below). A
+generic question is searched **unfiltered** - GarageFlow (or any repository) is
+never silently assumed to be the subject.
+
+### Repository name resolution (spoken project names)
+
+A speaker should not have to pronounce a repository slug. When the message has no
+explicit reference, the client resolves a **project name** against
+`GET {TRON_RAG_API_URL}/repos`, which advertises each indexed repository's name
+metadata:
+
+* The catalogue body is parsed defensively (several envelope keys and per-entry
+  identifier/name keys are accepted) - no repository name is hardcoded, and the
+  catalogue and LAN URL are never sent to the browser.
+* Names are compared **normalised** (lowercased, alphanumerics only), so the STT
+  spacing variant `"Garage Flow"` matches an indexed `"GarageFlow"`.
+* Priority is: **explicit** reference > **unique** project-name match > otherwise
+  no filter. An **ambiguous** name (matching several repositories) is never
+  guessed - the search stays unfiltered and no repository is claimed.
+* The catalogue is **cached briefly** (`TRON_RAG_REPOS_CACHE_MS`) with its own
+  bounded timeout (`TRON_RAG_REPOS_TIMEOUT_MS`). A catalogue timeout, error or
+  missing endpoint logs a metadata-only reason and **degrades to the existing
+  unfiltered search** - it can never break a conversation.
+* The resolved repository travels in the JSON `repository` field, not the query;
+  the v20 complementary-query, dedup, ranking and context bounds are unchanged.
+
+The resolution reason (`explicit` / `name` / `ambiguous` / `none` /
+`catalogue_unavailable`) is reported in the metadata-only `rag retrieval` log
+line - never the transcript.
 
 ### Query construction (relevance)
 
@@ -556,6 +586,9 @@ transcript text and source chunks are never logged.
 | `TRON_RAG_MAX_EXCERPT_CHARS` | `1200` | Per-excerpt cap. |
 | `TRON_RAG_MAX_TOTAL_CHARS` | `6000` | Whole-context cap (applied after merging). |
 | `TRON_RAG_MAX_QUERIES` | `2` | Complementary queries per turn (request-count bound). |
+| `TRON_RAG_REPOS_PATH` | `/repos` | Repository catalogue path used for project-name resolution. |
+| `TRON_RAG_REPOS_CACHE_MS` | `60000` | How long the fetched catalogue is cached. |
+| `TRON_RAG_REPOS_TIMEOUT_MS` | `2000` | Bounded catalogue fetch timeout before degrading to unfiltered. |
 
 > These values (including the LAN URL) are read from the process environment by
 the gateway. **Do not** put the RAG URL in frontend code or in any
@@ -581,7 +614,11 @@ They cover: query cleaning (repository ids, `cite the source file`, filler),
 complementary search-query construction, repository filtering, de-duplication and
 re-ranking (including the booking-workflow and `WorkshopClosing.tsx` cases),
 source attribution, TRON text retrieval, TRON voice retrieval (transcript query),
-HAL bypass, empty results, API failure/timeout, and bounded context.
+HAL bypass, empty results, API failure/timeout, and bounded context. They also
+cover repository-name resolution: unique project name, STT spacing variant
+(`Garage Flow`), explicit-slug precedence, ambiguous name, unknown name, missing
+catalogue, catalogue cache/expiry, and the natural GarageFlow booking question on
+both the typed and voice paths (`tests/test_rag_repos.py`).
 
 ## 7. WebSocket events
 
@@ -861,6 +898,16 @@ curl -s -H 'content-type: application/json' \
 curl -s -H 'content-type: application/json' \
   -d '{"sessionId":"t","message":"check the loft switch","routingMode":"HAL"}' \
   http://127.0.0.1:8787/api/chat
+
+# 28. TRON RAG project-name resolution (requires TRON_RAG_API_URL on the machine)
+#     A natural project name (no slug) must resolve via GET /repos and search
+#     that repository. Expect a `rag retrieval ... repository=<slug> reason=name`
+#     line, and a grounded answer citing repository/path.
+curl -s -H 'content-type: application/json' \
+  -d '{"sessionId":"t","message":"Tell me how GarageFlow makes a booking","routingMode":"TRON"}' \
+  http://127.0.0.1:8787/api/chat
+#     The same question spoken through the mic must resolve identically.
+#     An unknown project name must log reason=none and search unfiltered.
 ```
 
 Performance to record on real hardware: TTS init time, synthesis time and audio

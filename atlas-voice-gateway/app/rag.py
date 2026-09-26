@@ -44,6 +44,18 @@ message is decomposed, not sent verbatim:
   answer the question outrank pages that merely mention a file name or offer a
   marketing CTA.
 
+Repository name resolution
+--------------------------
+A speaker should not have to pronounce a repository slug. ``GET {TRON_RAG_API_URL}/repos``
+exposes the indexed repository catalogue; the client caches it briefly and matches
+any project name in the message (including STT spacing variants such as
+"Garage Flow" vs "GarageFlow") against the catalogue's name metadata. An explicit
+``repository:`` / ``repo=`` / bare slug reference always wins; a unique project name
+becomes the ``repository`` filter; an unknown or ambiguous name searches unfiltered
+and never claims a repository was identified. A catalogue failure is logged
+(metadata only) and degrades to the existing unfiltered search, so it can never
+break a conversation.
+
 Safety model
 ------------
 * Retrieved text is UNTRUSTED reference material. It is fenced between explicit
@@ -54,8 +66,10 @@ Safety model
 * Source attribution is preserved per chunk; the prompt forbids converting a
   path mention in one document into a claim about another file, and forbids
   assuming the omitted part of a mid-file chunk is known.
-* A repository filter is applied ONLY when the caller explicitly identifies one;
-  GarageFlow (or any indexed repository) is never silently assumed.
+* A repository filter is applied ONLY when a repository is identified - an
+  explicit reference, or a unique project-name match against the ``GET /repos``
+  catalogue. An ambiguous or unknown name stays unfiltered; GarageFlow (or any
+  indexed repository) is never silently assumed.
 * Timeouts, HTTP errors and malformed bodies degrade to a clear in-band status
   instead of raising into the chat pipeline, so the conversation always stays
   responsive and the model can tell "evidence unavailable" apart from "no
@@ -114,6 +128,157 @@ def extract_repository(text: str) -> Optional[str]:
     if slug:
         return slug.group(1)
     return None
+
+
+# --------------------------------------------------------------------------- #
+# Repository catalogue (GET /repos) -> project-name resolution
+# --------------------------------------------------------------------------- #
+
+# The Atlas RAG API's ``GET /repos`` body is inspected defensively rather than
+# assuming one exact envelope: several plausible container keys and per-entry
+# identifier/name keys are accepted. No repository name is ever hardcoded.
+_CATALOGUE_LIST_KEYS = ("repos", "repositories", "results", "data", "items", "projects")
+_CATALOGUE_SLUG_KEYS = (
+    "repository",
+    "slug",
+    "repo",
+    "repository_slug",
+    "readdy_repository",
+    "readdy_project_name",
+    "project",
+    "id",
+    "name",
+)
+_CATALOGUE_NAME_KEYS = (
+    "website_name",
+    "canonical_project_name",
+    "readdy_project_name",
+    "name",
+    "title",
+    "project_name",
+    "display_name",
+    "repo_name",
+    "label",
+)
+
+
+def _normalize_name(value: str) -> str:
+    """Collapse a project name for comparison: lowercased, alphanumerics only.
+
+    This is what lets a spoken "Garage Flow" (an STT spacing variant) match an
+    indexed "GarageFlow" without hardcoding either spelling.
+    """
+
+    return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
+
+
+def _iter_catalogue_entries(data: object) -> list[dict]:
+    """Best-effort extraction of repository entries from the ``/repos`` body."""
+
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    if isinstance(data, dict):
+        for key in _CATALOGUE_LIST_KEYS:
+            value = data.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        # A single repository object.
+        return [data]
+    return []
+
+
+def _first_str(source: dict, keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = source.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _entry_slug(entry: dict) -> str:
+    """The indexed repository identifier for one catalogue entry."""
+
+    slug = _first_str(entry, _CATALOGUE_SLUG_KEYS)
+    if slug:
+        return slug
+    metadata = entry.get("metadata")
+    if isinstance(metadata, dict):
+        return _first_str(metadata, _CATALOGUE_SLUG_KEYS)
+    return ""
+
+
+def _entry_names(entry: dict) -> list[str]:
+    """Human-facing names a speaker might say for one repository."""
+
+    names: list[str] = []
+    for source in (entry, entry.get("metadata")):
+        if not isinstance(source, dict):
+            continue
+        for key in _CATALOGUE_NAME_KEYS:
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                names.append(value.strip())
+            elif isinstance(value, list):
+                names.extend(str(item).strip() for item in value if str(item).strip())
+    return names
+
+
+@dataclass
+class _RepoCatalogue:
+    """Normalized alias -> repository-slug index built from ``GET /repos``."""
+
+    aliases: dict[str, set[str]] = field(default_factory=dict)
+
+    def resolve(self, message: str) -> tuple[Optional[str], str]:
+        """Return ``(repository, reason)`` for a message.
+
+        ``reason`` is ``"name"`` for a unique project-name match, ``"ambiguous"``
+        when a name maps to several repositories (never guessed) and ``"none"``
+        when nothing matched. Ambiguous and unknown both return ``None`` so the
+        caller searches unfiltered and never claims a repository was identified.
+        """
+
+        haystack = _normalize_name(message)
+        if not haystack:
+            return None, "none"
+
+        hits: set[str] = set()
+        for alias, slugs in self.aliases.items():
+            if len(alias) >= 3 and alias in haystack:
+                hits |= slugs
+
+        if len(hits) == 1:
+            return next(iter(hits)), "name"
+        if len(hits) > 1:
+            return None, "ambiguous"
+        return None, "none"
+
+
+def build_repo_catalogue(data: object) -> _RepoCatalogue:
+    """Build the alias index from a raw ``GET /repos`` body (any accepted shape)."""
+
+    aliases: dict[str, set[str]] = {}
+    for entry in _iter_catalogue_entries(data):
+        slug = _entry_slug(entry)
+        if not slug:
+            continue
+        slug_norm = _normalize_name(slug)
+        for name in _entry_names(entry):
+            normalized = _normalize_name(name)
+            # Skip empty and slug-shaped values: the slug is handled by the
+            # explicit-reference path, so it should not become a spoken alias.
+            if len(normalized) < 3 or normalized == slug_norm:
+                continue
+            aliases.setdefault(normalized, set()).add(slug)
+    return _RepoCatalogue(aliases=aliases)
+
+
+@dataclass
+class RepoResolution:
+    """How a repository filter was (or was not) chosen for one turn."""
+
+    repository: Optional[str] = None
+    reason: str = "none"
 
 
 # --------------------------------------------------------------------------- #
@@ -313,6 +478,9 @@ class RagResult:
     error: Optional[str] = None
     elapsed_ms: int = 0
     queries: list[str] = field(default_factory=list)
+    # How the repository filter was chosen: explicit | name | ambiguous | none |
+    # catalogue_unavailable. Metadata only - never surfaced to the model or browser.
+    repo_reason: str = ""
 
     @property
     def has_evidence(self) -> bool:
@@ -412,6 +580,9 @@ class RagClient:
         max_excerpt_chars: int = 1200,
         max_total_chars: int = 6000,
         max_queries: int = 2,
+        repos_path: str = "/repos",
+        repos_cache_ms: int = 60_000,
+        repos_timeout_s: float = 2.0,
         transport: Optional[httpx.AsyncBaseTransport] = None,
     ) -> None:
         self.base_url = (base_url or "").strip().rstrip("/")
@@ -422,6 +593,12 @@ class RagClient:
         self.max_excerpt_chars = max(0, int(max_excerpt_chars))
         self.max_total_chars = max(0, int(max_total_chars))
         self.max_queries = max(1, int(max_queries))
+        self.repos_path = "/" + (repos_path or "repos").strip().lstrip("/")
+        self.repos_cache_ms = max(0, int(repos_cache_ms))
+        self.repos_timeout_s = float(repos_timeout_s)
+        # Cached GET /repos catalogue (alias -> repository slug) with a short TTL.
+        self._catalogue: Optional[_RepoCatalogue] = None
+        self._catalogue_at = 0.0
         # Only tests inject a transport; production uses the default httpx one.
         self._transport = transport
 
@@ -527,6 +704,82 @@ class RagClient:
         else:
             outcome = RagResult(status=STATUS_EMPTY, repository=repository, queries=bounded)
         return self._finish(outcome, start)
+
+    async def _get_catalogue(self) -> Optional[_RepoCatalogue]:
+        """Return the cached ``GET /repos`` catalogue, refreshing it when stale.
+
+        The catalogue is cached for ``repos_cache_ms`` so a conversation does not
+        hammer ``GET /repos``. A fetch failure returns ``None`` (logged with
+        metadata only) so the caller falls back to an unfiltered search; it never
+        breaks the turn.
+        """
+
+        now = time.monotonic()
+        if self._catalogue is not None and (now - self._catalogue_at) * 1000.0 < self.repos_cache_ms:
+            return self._catalogue
+
+        catalogue = await self._fetch_catalogue()
+        if catalogue is not None:
+            self._catalogue = catalogue
+            self._catalogue_at = now
+        return catalogue
+
+    async def _fetch_catalogue(self) -> Optional[_RepoCatalogue]:
+        """Fetch and index ``GET /repos``. Returns ``None`` on any failure."""
+
+        start = time.perf_counter()
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(self.repos_timeout_s, connect=min(2.0, self.repos_timeout_s)),
+                transport=self._transport,
+            ) as client:
+                response = await client.get(f"{self.base_url}{self.repos_path}")
+                if response.status_code != 200:
+                    logger.info(
+                        "rag catalogue fetch status=http_%d in %dms",
+                        response.status_code,
+                        int((time.perf_counter() - start) * 1000),
+                    )
+                    return None
+                data = response.json()
+        except Exception as exc:  # noqa: BLE001 - the catalogue must never break a turn
+            logger.info(
+                "rag catalogue fetch failed error=%s in %dms",
+                type(exc).__name__,
+                int((time.perf_counter() - start) * 1000),
+            )
+            return None
+
+        catalogue = build_repo_catalogue(data)
+        logger.info(
+            "rag catalogue loaded aliases=%d in %dms",
+            len(catalogue.aliases),
+            int((time.perf_counter() - start) * 1000),
+        )
+        return catalogue
+
+    async def resolve_repository(self, message: str) -> RepoResolution:
+        """Choose a repository filter for a turn.
+
+        Explicit references (``repository:`` / ``repo=`` / a bare indexed slug)
+        always win and never touch the network. Otherwise the project name is
+        matched against the cached ``GET /repos`` catalogue. A unique match
+        becomes the filter; no match or an ambiguous match returns ``None`` so the
+        search runs unfiltered and no repository is claimed.
+        """
+
+        explicit = extract_repository(message)
+        if explicit:
+            return RepoResolution(repository=explicit, reason="explicit")
+
+        if not self.configured:
+            return RepoResolution()
+
+        catalogue = await self._get_catalogue()
+        if catalogue is None:
+            return RepoResolution(reason="catalogue_unavailable")
+        repository, reason = catalogue.resolve(message)
+        return RepoResolution(repository=repository, reason=reason)
 
     @staticmethod
     def _finish(result: RagResult, start: float) -> RagResult:
@@ -670,6 +923,11 @@ async def retrieve_context(client: RagClient, agent_id: str, query: str) -> Opti
 
     if agent_id != AGENT_TRON or not client.configured:
         return None
-    repository = extract_repository(query)
+    # Resolve the repository filter: explicit reference first, then a unique
+    # project name from the cached GET /repos catalogue. Unresolved/ambiguous
+    # stays unfiltered - a repository is never silently assumed.
+    resolution = await client.resolve_repository(query)
     queries = build_search_queries(query)
-    return await client.search_multi(queries, repository=repository)
+    result = await client.search_multi(queries, repository=resolution.repository)
+    result.repo_reason = resolution.reason
+    return result
