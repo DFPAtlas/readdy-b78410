@@ -499,13 +499,44 @@ POST {TRON_RAG_API_URL}/search
 `readdy-5650b0`). A generic question is searched **unfiltered** - GarageFlow (or
 any repository) is never silently assumed to be the subject.
 
+### Query construction (relevance)
+
+The raw user message is a poor search query. Sending
+`"In repository readdy-5650b0, how does GarageFlow handle workshop bookings? Cite
+the source file"` verbatim makes the retriever rank closing components and
+`index.html` above real booking documentation. So the message is decomposed:
+
+* `clean_query()` strips only **retrieval boilerplate** - repository identifiers
+  (which travel as the separate JSON `repository` field instead), citation
+  instructions (`cite the source file`, `with citations`, ...) and conversational
+  filler (`please`, `can you`, `tell me`). Technical terms, file names and the
+  user's meaning are preserved.
+* `build_search_queries()` then adds **at most one** complementary, concise topic
+  query (interrogatives / auxiliaries / filler removed), so both broad workflow
+  questions and specific file questions get a good lexical match. A simple
+  question with no boilerplate issues exactly one request.
+* Results from every query are **merged, de-duplicated** by chunk/document
+  identity (falling back to repository/path/content) and **re-ranked**: chunks
+  whose *path* is the file the user asked about are boosted, chunks that merely
+  *mention* that file are mildly demoted, and marketing/CTA pages are demoted
+  unless the user explicitly asked for them. Source attribution is preserved per
+  chunk.
+
+The number of queries per turn is bounded by `TRON_RAG_MAX_QUERIES`, and the
+overall context is bounded by `TRON_RAG_MAX_TOTAL_CHARS` *after* merging, so
+request count and total retrieval time stay small.
+
 ### Safety and failure handling
 
 * Retrieved text is treated as **untrusted reference material**: it is fenced
   between `BEGIN/END RETRIEVED REFERENCE MATERIAL` markers and the system prompt
   tells TRON to treat it as data, never instructions.
 * Each excerpt is truncated to `TRON_RAG_MAX_EXCERPT_CHARS` and the whole block
-to `TRON_RAG_MAX_TOTAL_CHARS`.
+to `TRON_RAG_MAX_TOTAL_CHARS` (the total cap is applied after merging).
+* Source attribution is per chunk: the prompt forbids attributing one file's
+  contents to another, forbids citing a file merely because another document
+  mentions its path, and forbids assuming the omitted part of a mid-file chunk is
+  known.
 * **Timeouts, HTTP errors, unreachable service or empty results never break the
   turn.** The model is told the outcome explicitly so its answer can distinguish
   "evidence unavailable" from "no relevant matches", and it is instructed never
@@ -523,7 +554,8 @@ transcript text and source chunks are never logged.
 | `TRON_RAG_MIN_SIMILARITY` | `0.4` | Similarity threshold (matches the verified call). |
 | `TRON_RAG_TIMEOUT_MS` | `4000` | Retrieval timeout before degrading to ungrounded. |
 | `TRON_RAG_MAX_EXCERPT_CHARS` | `1200` | Per-excerpt cap. |
-| `TRON_RAG_MAX_TOTAL_CHARS` | `6000` | Whole-context cap. |
+| `TRON_RAG_MAX_TOTAL_CHARS` | `6000` | Whole-context cap (applied after merging). |
+| `TRON_RAG_MAX_QUERIES` | `2` | Complementary queries per turn (request-count bound). |
 
 > These values (including the LAN URL) are read from the process environment by
 the gateway. **Do not** put the RAG URL in frontend code or in any
@@ -545,9 +577,11 @@ cd atlas-voice-gateway
 .venv/bin/python -m pytest tests -q
 ```
 
-They cover: TRON text retrieval, TRON voice retrieval (transcript query), HAL
-bypass, empty results, API failure/timeout, repository filtering, and bounded
-context.
+They cover: query cleaning (repository ids, `cite the source file`, filler),
+complementary search-query construction, repository filtering, de-duplication and
+re-ranking (including the booking-workflow and `WorkshopClosing.tsx` cases),
+source attribution, TRON text retrieval, TRON voice retrieval (transcript query),
+HAL bypass, empty results, API failure/timeout, and bounded context.
 
 ## 7. WebSocket events
 
@@ -819,8 +853,10 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8787/api/speech/audio/
 #     A TRON question about an indexed feature should log a `rag retrieval`
 #     line and return a grounded answer citing repository/path.
 curl -s -H 'content-type: application/json' \
-  -d '{"sessionId":"t","message":"readdy-5650b0 GarageFlow booking workflow","routingMode":"TRON"}' \
+  -d '{"sessionId":"t","message":"In repository readdy-5650b0, how does GarageFlow handle workshop bookings? Cite the source file","routingMode":"TRON"}' \
   http://127.0.0.1:8787/api/chat
+#     Expect a `rag retrieval ... status=ok results=N` line and an answer that
+#     cites a real repository/path from the returned results (not a marketing page).
 #     A HAL question must NOT produce a `rag retrieval` log line (HAL bypass).
 curl -s -H 'content-type: application/json' \
   -d '{"sessionId":"t","message":"check the loft switch","routingMode":"HAL"}' \

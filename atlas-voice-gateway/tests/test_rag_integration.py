@@ -125,7 +125,8 @@ def test_tron_text_turn_is_grounded():
     )
 
     assert status == 200
-    assert captured["body"]["query"] == "readdy-5650b0 booking workflow"
+    # The repository slug is a filter, not part of the search text.
+    assert captured["body"]["query"] == "booking workflow"
     assert captured["body"]["repository"] == "readdy-5650b0"
 
     system, user = tron.received[0]
@@ -141,15 +142,22 @@ def test_tron_text_turn_is_grounded():
 def test_tron_voice_turn_uses_transcript_as_query():
     # /api/voice transcribes audio then calls this SAME function with the
     # transcript as the message, so this proves the voice path retrieves too.
-    captured = {}
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"results": []})
+
     transcript = "what does the GarageFlow booking workflow do"
-    state, hal, tron = _make_state(_rag(_grounded_handler(captured)))
+    state, hal, tron = _make_state(_rag(handler))
 
     status, _ = asyncio.run(_execute_chat(state, "s1", transcript, RoutingMode.TRON))
 
     assert status == 200
-    assert captured["body"]["query"] == transcript
-    assert "repository" not in captured["body"]  # generic question: no filter
+    assert bodies, "retrieval should run for TRON"
+    # The first query is the cleaned message; technical terms survive intact.
+    assert bodies[0]["query"] == transcript
+    assert all("repository" not in body for body in bodies)  # generic: no filter
     assert tron.received[0][1]["content"] == transcript
 
 
@@ -269,3 +277,116 @@ def test_compose_is_honest_when_unavailable():
 
     assert "UNAVAILABLE" in prompt
     assert "invent" in prompt.lower()
+
+
+# ------------------------------------------- query construction (end to end)
+
+
+def _multi_body_client(bodies, responder=None):
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        bodies.append(body)
+        if responder is not None:
+            return responder(body)
+        return httpx.Response(200, json={"results": []})
+
+    return handler
+
+
+def test_booking_workflow_message_retrieves_and_cites_a_booking_chunk():
+    bodies: list[dict] = []
+
+    def responder(body: dict) -> httpx.Response:
+        query = str(body.get("query", "")).lower()
+        if "booking" in query and "cite" not in query:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "content": "GarageFlow workshop booking: create -> confirm -> invoice",
+                            "repository": "readdy-5650b0",
+                            "path": "src/data/helpArticles.ts",
+                            "similarity": 0.81,
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(200, json={"results": []})
+
+    state, hal, tron = _make_state(_rag(_multi_body_client(bodies, responder=responder)))
+    message = (
+        "In repository readdy-5650b0, how does GarageFlow handle workshop bookings? "
+        "Cite the source file"
+    )
+
+    status, _ = asyncio.run(_execute_chat(state, "s1", message, RoutingMode.TRON))
+
+    assert status == 200
+    assert bodies, "TRON must have called /search"
+    # Boilerplate is gone; the repository travels as the filter, not the query.
+    assert any("booking" in body["query"].lower() for body in bodies)
+    assert all("cite" not in body["query"].lower() for body in bodies)
+    assert all("readdy-5650b0" not in body["query"] for body in bodies)
+    assert all(body.get("repository") == "readdy-5650b0" for body in bodies)
+    # A real citation reaches the grounded prompt.
+    assert "readdy-5650b0:src/data/helpArticles.ts" in tron.received[0][0]["content"]
+
+
+def test_file_question_uses_the_file_content_not_a_mention():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "content": "See WorkshopClosing.tsx for the closing band. Book a demo.",
+                        "repository": "readdy-5650b0",
+                        "path": "src/pages/index.html",
+                        "similarity": 0.62,
+                    },
+                    {
+                        "content": "export default function WorkshopClosing() { /* closing band */ }",
+                        "repository": "readdy-5650b0",
+                        "path": "src/components/WorkshopClosing.tsx",
+                        "similarity": 0.55,
+                    },
+                ]
+            },
+        )
+
+    state, hal, tron = _make_state(_rag(handler))
+
+    asyncio.run(_execute_chat(state, "s1", "how does WorkshopClosing.tsx work", RoutingMode.TRON))
+
+    prompt = tron.received[0][0]["content"]
+    first_source = next(
+        line for line in prompt.splitlines() if line.startswith("[1] source=")
+    )
+    assert "WorkshopClosing.tsx" in first_source
+
+
+def test_duplicate_chunk_from_both_queries_is_cited_once():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "content": "GarageFlow booking workflow guide",
+                        "repository": "readdy-5650b0",
+                        "path": "src/data/helpArticles.ts",
+                        "similarity": 0.8,
+                    }
+                ]
+            },
+        )
+
+    state, hal, tron = _make_state(_rag(handler))
+
+    asyncio.run(
+        _execute_chat(state, "s1", "how does GarageFlow handle workshop bookings?", RoutingMode.TRON)
+    )
+
+    prompt = tron.received[0][0]["content"]
+    assert prompt.count("source=readdy-5650b0:src/data/helpArticles.ts") == 1

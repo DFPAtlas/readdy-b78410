@@ -116,6 +116,7 @@ class Settings:
     tron_rag_timeout_ms: int
     tron_rag_max_excerpt_chars: int
     tron_rag_max_total_chars: int
+    tron_rag_max_queries: int
 
     @property
     def request_timeout_s(self) -> float:
@@ -217,4 +218,7 @@ def load_settings() -> Settings:
         tron_rag_timeout_ms=_env_int("TRON_RAG_TIMEOUT_MS", 4_000),
         tron_rag_max_excerpt_chars=_env_int("TRON_RAG_MAX_EXCERPT_CHARS", 1_200),
         tron_rag_max_total_chars=_env_int("TRON_RAG_MAX_TOTAL_CHARS", 6_000),
+        # Complementary queries per turn (cleaned query + at most one concise
+        # topic query). Bounds both request count and total retrieval time.
+        tron_rag_max_queries=_env_int("TRON_RAG_MAX_QUERIES", 2),
     )

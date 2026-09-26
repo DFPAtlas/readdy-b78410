@@ -298,6 +298,31 @@ When live data is added later, these become the shapes returned by the backend.
   verified on the machine with `TRON_RAG_API_URL` set.
 - Status: **complete** (source delivered; live end-to-end verification is out of scope for this agent)
 
+### Phase 15: TRON RAG search relevance (query construction + re-ranking)
+- Goal: Improve what TRON actually searches for and which chunks it trusts, without rebuilding the
+  integration. The raw user message (with `In repository ...` and `Cite the source file`) was ranking
+  marketing/closing pages above real documentation.
+- Deliverable (inside `atlas-voice-gateway/`, repository code only):
+  - `app/rag.py` — `clean_query()` strips only retrieval boilerplate (repository ids, citation
+    instructions, conversational filler) while preserving technical terms and file names;
+    `build_search_queries()` adds at most one complementary concise topic query;
+    `search_multi()` merges results, de-duplicates by chunk/document identity (fallback
+    repository/path/content) and re-ranks so the file the user asked about outranks a page that
+    merely mentions it and marketing CTAs are demoted. Source attribution is preserved per chunk;
+    context bounds are applied after merging. The grounded prompt now forbids cross-file attribution
+    and assuming the omitted part of a mid-file chunk is known.
+  - `app/config.py` + `.env.example` — new `TRON_RAG_MAX_QUERIES` (default 2) bounding request count;
+    `TRON_RAG_TIMEOUT_MS` unchanged and compatible with the deployed `15000` value.
+  - `tests/` — mocked coverage for query cleaning, complementary search, repository filtering,
+    de-duplication, re-ranking (booking-workflow and `WorkshopClosing.tsx` cases), source
+    attribution, and timeout/failure.
+- Preserved: the explicit-only repository filter, the TRON-only server-side seam, all HTTP/WS
+  contracts, voice playback/streaming/cancellation and HAL's local TTS. No frontend changes.
+- Rollback: revert this phase's `rag.py` / `config.py` / docs / test changes; the working RAG
+  integration and the index are untouched.
+- Note: tests are mocked; live relevance against the running RAG API must be confirmed on the machine.
+- Status: **complete** (source delivered; live verification is out of scope for this agent)
+
 ### Next phase ideas (not started)
 - Rolling telemetry charts for GPU / RAM history
 - Keyboard shortcuts and command palette

@@ -83,6 +83,7 @@ class AppContext:
             timeout_s=cfg.tron_rag_timeout_s,
             max_excerpt_chars=cfg.tron_rag_max_excerpt_chars,
             max_total_chars=cfg.tron_rag_max_total_chars,
+            max_queries=cfg.tron_rag_max_queries,
         )
         # requestId -> cancellation event for an in-flight synthesis job.
         self.speech_cancels: dict[str, threading.Event] = {}
