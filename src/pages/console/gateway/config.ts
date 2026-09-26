@@ -6,8 +6,16 @@
  * set, the console stays fully usable in demo mode and live send is disabled.
  */
 
-const RAW_BASE_URL =
-  ((import.meta.env.VITE_ATLAS_VOICE_GATEWAY_URL as string | undefined) ?? "").trim();
+/**
+ * The value is read from `VITE_PUBLIC_ATLAS_VOICE_GATEWAY_URL` first — that is the
+ * name the production build platform injects for public, client-safe values.
+ * `VITE_ATLAS_VOICE_GATEWAY_URL` is still honoured as a fallback for older setups.
+ */
+const RAW_BASE_URL = (
+  (import.meta.env.VITE_PUBLIC_ATLAS_VOICE_GATEWAY_URL as string | undefined) ??
+  (import.meta.env.VITE_ATLAS_VOICE_GATEWAY_URL as string | undefined) ??
+  ""
+).trim();
 
 export interface GatewayConfig {
   baseUrl: string;
