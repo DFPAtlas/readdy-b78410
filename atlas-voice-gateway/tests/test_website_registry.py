@@ -25,3 +25,31 @@ def test_garageflow_capabilities_include_reversible_booking_write():
     connector = GarageFlowConnector(base_url="https://example.test", api_key="secret")
     caps = {cap.name: cap.risk.value for cap in connector.descriptor.capabilities}
     assert caps["bookings.request"] == "write_reversible"
+
+
+import httpx
+import pytest
+
+
+@pytest.mark.asyncio
+async def test_garageflow_availability_requires_authoritative_response():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/api/v1/bookings/availability")
+        assert request.url.params["date"] == "2026-09-29"
+        assert request.url.params["duration_minutes"] == "60"
+        return httpx.Response(200, json={
+            "authoritative": True,
+            "data": [{"starts_at": "2026-09-29T08:00:00Z", "ends_at": "2026-09-29T09:00:00Z"}],
+        })
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        connector = GarageFlowConnector(
+            base_url="https://garageflow.example",
+            api_key="secret",
+            client=client,
+        )
+        slots = await connector.availability(date="2026-09-29", duration_minutes=60)
+
+    assert len(slots) == 1
+    assert slots[0]["starts_at"] == "2026-09-29T08:00:00Z"
