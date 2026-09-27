@@ -83,6 +83,26 @@ class GarageFlowConnector:
         result = await self._request("GET", "customers", params={"search": search, "per_page": 20})
         return list(result.get("data") or [])
 
+    async def find_customer_by_phone(self, phone: str) -> list[dict]:
+        """Find customer candidates using a normalised caller telephone number."""
+
+        digits = "".join(ch for ch in (phone or "") if ch.isdigit() or ch == "+")
+        if not digits:
+            return []
+        candidates = await self.find_customers(digits)
+        if candidates:
+            return candidates
+
+        # UK callers may arrive as +44... while the CRM stores 0..., or vice versa.
+        alternate = ""
+        if digits.startswith("+44"):
+            alternate = "0" + digits[3:]
+        elif digits.startswith("44"):
+            alternate = "0" + digits[2:]
+        elif digits.startswith("0"):
+            alternate = "+44" + digits[1:]
+        return await self.find_customers(alternate) if alternate else []
+
     async def find_vehicles(self, search: str) -> list[dict]:
         result = await self._request("GET", "vehicles", params={"search": search, "per_page": 20})
         return list(result.get("data") or [])
