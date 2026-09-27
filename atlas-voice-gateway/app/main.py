@@ -34,6 +34,10 @@ from .audio import AudioError, read_upload, prepare_audio
 from .audio_store import AudioStore
 from .config import Settings, load_settings
 from .events import event
+from .garageflow_connector import GarageFlowConnector
+from .garageflow_workflow import GarageFlowCallWorkflow
+from .master_agent import MasterVoiceAgent
+from .website_registry import WebsiteRegistry
 from .models import (
     ChatRequest,
     MuteRequest,
@@ -70,6 +74,10 @@ class AppContext:
         self.registry = AgentRegistry(cfg)
         self.sessions = SessionStore()
         self.router = AutoRouter()
+        self.master = MasterVoiceAgent()
+        self.garageflow = GarageFlowConnector()
+        self.websites = WebsiteRegistry([self.garageflow])
+        self.garageflow_calls = GarageFlowCallWorkflow(self.sessions, self.garageflow)
         self.connections = ConnectionManager()
         self.stt = STTService(cfg)
         self.tts = TTSService(cfg)
@@ -676,6 +684,73 @@ async def agents_endpoint(request: Request) -> dict:
     return {"agents": list(_agents_payload(state).values())}
 
 
+@app.get("/api/websites")
+async def websites_endpoint(request: Request) -> dict:
+    """Public-safe connected website capability catalogue."""
+
+    state: AppContext = request.app.state.ctx
+    return {"websites": state.websites.public_catalogue()}
+
+
+@app.post("/api/workflows/garageflow/{session_id}/start")
+async def start_garageflow_call(session_id: str, request: Request) -> dict:
+    """Attach GarageFlow telephone-booking state to an existing voice session."""
+
+    state: AppContext = request.app.state.ctx
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    caller_phone = str(body.get("callerPhone") or "").strip() or None
+    call_state = state.garageflow_calls.start(session_id, caller_phone)
+
+    identification = None
+    if caller_phone and state.garageflow.configured():
+        try:
+            identification = await state.garageflow_calls.identify_by_caller_phone(session_id)
+        except Exception:
+            logger.exception("GarageFlow caller lookup failed session=%s", session_id)
+            identification = {"status": "error", "code": "garageflow_lookup_failed"}
+
+    await state.connections.broadcast(
+        event(
+            "activity",
+            sessionId=session_id,
+            payload={
+                "type": "workflow",
+                "status": "active",
+                "label": "GarageFlow telephone booking started",
+                "website": "garageflow",
+                "stage": call_state.stage.value,
+            },
+        )
+    )
+    return {
+        "sessionId": session_id,
+        "workflow": "garageflow_booking",
+        "configured": state.garageflow.configured(),
+        "state": state.garageflow_calls.public_state(session_id),
+        "identification": identification,
+    }
+
+
+@app.get("/api/workflows/garageflow/{session_id}")
+async def garageflow_call_state(session_id: str, request: Request) -> dict:
+    state: AppContext = request.app.state.ctx
+    public = state.garageflow_calls.public_state(session_id)
+    if public is None:
+        raise HTTPException(status_code=404, detail="garageflow_call_not_started")
+    return {"sessionId": session_id, "workflow": "garageflow_booking", "state": public}
+
+
+@app.delete("/api/workflows/garageflow/{session_id}")
+async def end_garageflow_call(session_id: str, request: Request) -> dict:
+    state: AppContext = request.app.state.ctx
+    state.garageflow_calls.end(session_id)
+    return {"sessionId": session_id, "status": "ended"}
+
+
 @app.get("/api/status")
 async def status_endpoint(request: Request) -> dict:
     state: AppContext = request.app.state.ctx
@@ -690,6 +765,7 @@ async def status_endpoint(request: Request) -> dict:
         "speechAudioResources": state.audio_store.count,
         "speechAudioBytes": state.audio_store.byte_size,
         "agents": _agents_payload(state),
+        "websites": state.websites.public_catalogue(),
     }
 
 
