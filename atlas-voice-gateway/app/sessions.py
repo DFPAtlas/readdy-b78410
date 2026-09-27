@@ -33,6 +33,9 @@ class SessionState:
     session_id: str
     selected_agent: Optional[str] = None
     active_request_id: Optional[str] = None
+    active_workflow: Optional[str] = None
+    workflow_state: object | None = None
+    last_activity_at: float = field(default_factory=time.time)
     created_at: float = field(default_factory=time.time)
 
 
@@ -48,6 +51,7 @@ class SessionStore:
         if session is None:
             session = SessionState(session_id=session_id)
             self.sessions[session_id] = session
+        session.last_activity_at = time.time()
         return session
 
     # --------------------------------------------------------------- requests
@@ -109,7 +113,7 @@ class SessionStore:
         stale = [
             sid
             for sid, session in self.sessions.items()
-            if session.active_request_id is None and now - session.created_at > max_age_s * 6
+            if session.active_request_id is None and now - session.last_activity_at > max_age_s * 6
         ]
         for sid in stale:
             self.sessions.pop(sid, None)
