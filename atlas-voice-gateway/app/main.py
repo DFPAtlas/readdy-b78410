@@ -36,6 +36,7 @@ from .config import Settings, load_settings
 from .events import event
 from .garageflow_connector import GarageFlowConnector
 from .garageflow_workflow import GarageFlowCallWorkflow
+from .garageflow_turns import GarageFlowTurnExecutor
 from .master_agent import MasterVoiceAgent
 from .website_registry import WebsiteRegistry
 from .models import (
@@ -78,6 +79,7 @@ class AppContext:
         self.garageflow = GarageFlowConnector()
         self.websites = WebsiteRegistry([self.garageflow])
         self.garageflow_calls = GarageFlowCallWorkflow(self.sessions, self.garageflow)
+        self.garageflow_turns = GarageFlowTurnExecutor(self.garageflow_calls)
         self.connections = ConnectionManager()
         self.stt = STTService(cfg)
         self.tts = TTSService(cfg)
@@ -764,6 +766,56 @@ async def garageflow_call_state(session_id: str, request: Request) -> dict:
     if public is None:
         raise HTTPException(status_code=404, detail="garageflow_call_not_started")
     return {"sessionId": session_id, "workflow": "garageflow_booking", "state": public}
+
+
+@app.post("/api/workflows/garageflow/{session_id}/turn")
+async def garageflow_call_turn(session_id: str, request: Request) -> dict:
+    """Apply one final transcript to the GarageFlow booking state machine."""
+
+    state: AppContext = request.app.state.ctx
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    transcript = str(body.get("transcript") or "").strip()
+    if not transcript:
+        raise HTTPException(status_code=400, detail="transcript_required")
+
+    try:
+        result = await state.garageflow_turns.handle(session_id, transcript)
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=409,
+            content={"status": "error", "code": str(exc), "sessionId": session_id},
+        )
+    except RuntimeError as exc:
+        logger.warning("GarageFlow workflow runtime error session=%s code=%s", session_id, exc)
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "code": str(exc), "sessionId": session_id},
+        )
+
+    await state.connections.broadcast(
+        event(
+            "activity",
+            sessionId=session_id,
+            payload={
+                "type": "workflow",
+                "status": "active" if result.get("stage") not in ("complete", "escalate") else "complete",
+                "label": "GarageFlow call advanced",
+                "website": "garageflow",
+                "stage": result.get("stage"),
+                "action": result.get("action"),
+            },
+        )
+    )
+
+    return {
+        "sessionId": session_id,
+        "workflow": "garageflow_booking",
+        "turn": result,
+        "state": state.garageflow_calls.public_state(session_id),
+    }
 
 
 @app.delete("/api/workflows/garageflow/{session_id}")
