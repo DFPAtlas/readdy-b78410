@@ -98,6 +98,28 @@ class GarageFlowConnector:
         result = await self._request("GET", "bookings", params=params)
         return list(result.get("data") or [])
 
+    async def availability(
+        self,
+        *,
+        date: str,
+        duration_minutes: int,
+        interval_minutes: int = 30,
+    ) -> list[dict]:
+        """Return GarageFlow-authoritative workshop slots for one local date."""
+
+        result = await self._request(
+            "GET",
+            "bookings/availability",
+            params={
+                "date": date,
+                "duration_minutes": duration_minutes,
+                "interval_minutes": interval_minutes,
+            },
+        )
+        if result.get("authoritative") is not True:
+            raise RuntimeError("garageflow_non_authoritative_availability")
+        return list(result.get("data") or [])
+
     async def create_booking_request(
         self,
         *,
