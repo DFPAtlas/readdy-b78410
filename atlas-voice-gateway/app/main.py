@@ -546,6 +546,151 @@ def _unknown_preferred_agent(preferred_agent: Optional[str]) -> Optional[str]:
     return candidate
 
 
+async def _garageflow_audio_turn(
+    state: AppContext,
+    *,
+    session_id: str,
+    raw_audio: bytes,
+    content_type: Optional[str],
+    filename: Optional[str],
+    language: Optional[str] = None,
+    speak: bool = True,
+) -> tuple[int, dict]:
+    """Run one GarageFlow telephone turn: audio -> STT -> workflow -> TTS.
+
+    This path deliberately bypasses HAL/TRON generation. The deterministic
+    GarageFlow workflow decides what happens; the speech engine only voices the
+    safe reply produced by that workflow.
+    """
+
+    if state.garageflow_calls.get(session_id) is None:
+        return 409, {
+            "status": "error",
+            "code": "garageflow_call_not_started",
+            "sessionId": session_id,
+        }
+
+    try:
+        prepared = await prepare_audio(raw_audio, content_type, filename, state.settings)
+    except AudioError as exc:
+        return exc.status_code, {
+            "status": "error",
+            "code": exc.code,
+            "message": exc.message,
+            "sessionId": session_id,
+        }
+
+    await state.connections.broadcast(
+        event(
+            "transcription_started",
+            sessionId=session_id,
+            payload={"model": state.stt.model, "device": state.stt.device, "workflow": "garageflow_booking"},
+        )
+    )
+
+    try:
+        stt_result = await state.stt.transcribe(prepared, session_id=session_id, language=language)
+    except STTError as exc:
+        if exc.code == "no_speech_detected":
+            return 200, {
+                "status": "no_speech_detected",
+                "sessionId": session_id,
+                "workflow": "garageflow_booking",
+                "transcript": "",
+            }
+        return exc.status_code, {
+            "status": "error",
+            "code": exc.code,
+            "message": exc.message,
+            "sessionId": session_id,
+        }
+
+    transcript = stt_result.transcript.strip()
+    await state.connections.broadcast(
+        event(
+            "transcript_final",
+            sessionId=session_id,
+            payload={
+                "transcript": transcript,
+                "language": stt_result.language,
+                "duration": stt_result.duration_s,
+                "processingTime": stt_result.processing_ms,
+                "workflow": "garageflow_booking",
+            },
+        )
+    )
+
+    try:
+        turn = await state.garageflow_turns.handle(session_id, transcript)
+    except ValueError as exc:
+        return 409, {
+            "status": "error",
+            "code": str(exc),
+            "sessionId": session_id,
+            "transcript": transcript,
+        }
+    except RuntimeError as exc:
+        logger.warning("GarageFlow audio workflow runtime error session=%s code=%s", session_id, exc)
+        return 503, {
+            "status": "error",
+            "code": str(exc),
+            "sessionId": session_id,
+            "transcript": transcript,
+        }
+
+    reply = str(turn.get("reply") or "").strip()
+    request_id = f"gf_{uuid.uuid4().hex[:12]}"
+    speech: dict = {"speechStatus": "skipped_disabled"}
+
+    if speak and reply:
+        try:
+            # Dedicated receptionist voice is a later configuration item.
+            # Reuse the current HAL Piper voice for V1 rather than inventing a
+            # voice identifier the TTS service does not support.
+            spoken = await _run_speech(state, AGENT_HAL, reply, session_id, request_id)
+            speech = {
+                "speechStatus": "synthesized",
+                "voiceId": spoken.get("voiceId"),
+                "audioRef": spoken.get("audioRef"),
+                "audioContentType": spoken.get("contentType"),
+                "speechDurationMs": spoken.get("durationMs"),
+            }
+        except TTSCancelled:
+            speech = {"speechStatus": "interrupted"}
+        except TTSError as exc:
+            logger.info("GarageFlow reply synthesis failed session=%s code=%s", session_id, exc.code)
+            speech = {"speechStatus": "failed", "speechError": exc.code}
+
+    await state.connections.broadcast(
+        event(
+            "activity",
+            sessionId=session_id,
+            requestId=request_id,
+            payload={
+                "type": "workflow",
+                "status": "complete" if turn.get("stage") in ("complete", "escalate") else "active",
+                "label": "GarageFlow telephone turn complete",
+                "website": "garageflow",
+                "stage": turn.get("stage"),
+                "action": turn.get("action"),
+            },
+        )
+    )
+
+    return 200, {
+        "status": "complete",
+        "sessionId": session_id,
+        "requestId": request_id,
+        "workflow": "garageflow_booking",
+        "transcript": transcript,
+        "language": stt_result.language,
+        "processingTime": stt_result.processing_ms,
+        "turn": turn,
+        "state": state.garageflow_calls.public_state(session_id),
+        **speech,
+    }
+
+
 # ---------------------------------------------------------------------- loops
 
 
@@ -671,6 +816,7 @@ async def root() -> dict:
         "endpoints": [
             "/health", "/api/agents", "/api/status", "/api/chat",
             "/api/transcribe", "/api/voice", "/api/speech",
+            "/api/workflows/garageflow/{sessionId}/audio-turn",
             "/api/speech/audio/{audioId}", "/ws",
         ],
     }
@@ -816,6 +962,37 @@ async def garageflow_call_turn(session_id: str, request: Request) -> dict:
         "turn": result,
         "state": state.garageflow_calls.public_state(session_id),
     }
+
+
+@app.post("/api/workflows/garageflow/{session_id}/audio-turn")
+async def garageflow_audio_turn(
+    session_id: str,
+    request: Request,
+    audio: UploadFile = File(...),
+    language: Optional[str] = Form(None),
+    speak: Optional[str] = Form("true"),
+):
+    """Complete one caller audio turn: STT -> GarageFlow state -> spoken reply."""
+
+    state: AppContext = request.app.state.ctx
+    try:
+        raw = await read_upload(audio, state.settings)
+    except AudioError as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"status": "error", "code": exc.code, "message": exc.message, "sessionId": session_id},
+        )
+
+    status_code, body = await _garageflow_audio_turn(
+        state,
+        session_id=session_id,
+        raw_audio=raw,
+        content_type=audio.content_type,
+        filename=audio.filename,
+        language=language,
+        speak=_parse_speak_flag(speak) is not False,
+    )
+    return JSONResponse(status_code=status_code, content=body)
 
 
 @app.delete("/api/workflows/garageflow/{session_id}")
