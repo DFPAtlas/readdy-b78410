@@ -131,7 +131,13 @@ def _iso(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
 
 
-def _resolve_route(state: AppContext, mode: RoutingMode, message: str, preferred_agent: Optional[str] = None) -> dict:
+def _resolve_route(
+    state: AppContext,
+    mode: RoutingMode,
+    message: str,
+    preferred_agent: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> dict:
     """Decide which agent should handle the request.
 
     Explicit HAL/TRON selections never silently switch agents: if the chosen
@@ -150,19 +156,29 @@ def _resolve_route(state: AppContext, mode: RoutingMode, message: str, preferred
             return {"agent": None, "error": "agent_unavailable", "message": "TRON is currently unavailable"}
         return {"agent": AGENT_TRON, "reason": "explicit", "intent": "engineering"}
 
-    # AUTO
+    # AUTO is owned by the Master Voice Agent. The current session agent is a
+    # continuity hint only; explicit HAL/TRON modes above remain authoritative.
     if not available:
         return {"agent": None, "error": "local_ai_unavailable", "message": "Local AI unavailable"}
 
-    if preferred_agent:
-        hint = preferred_agent.strip().lower()
-        if hint in ("atlas-hal", "hal") and AGENT_HAL in available:
-            return {"agent": AGENT_HAL, "reason": "preferred", "intent": "infrastructure"}
-        if hint in ("atlas-tron", "tron") and AGENT_TRON in available:
-            return {"agent": AGENT_TRON, "reason": "preferred", "intent": "engineering"}
+    current_agent = None
+    if session_id:
+        current_agent = state.sessions.touch_session(session_id).selected_agent
 
-    agent_id, reason, intent = state.router.pick(message, available)
-    return {"agent": agent_id, "reason": reason, "intent": intent}
+    decision = state.master.decide(
+        message,
+        available,
+        preferred_agent=preferred_agent,
+        current_agent=current_agent,
+    )
+    return {
+        "agent": decision.selected_agent,
+        "reason": decision.reason,
+        "intent": decision.intent,
+        "confidence": decision.confidence,
+        "continuation": decision.continuation,
+        "requestedAgents": list(decision.requested_agents),
+    }
 
 
 async def _execute_chat(
@@ -187,7 +203,7 @@ async def _execute_chat(
     if state.sessions.active_request_count() >= cfg.max_concurrent_total:
         return 429, {"status": "error", "code": "too_many_requests", "message": "Too many active requests."}
 
-    decision = _resolve_route(state, routing_mode, message, preferred_agent)
+    decision = _resolve_route(state, routing_mode, message, preferred_agent, session_id)
     if decision["agent"] is None:
         await state.connections.broadcast(
             event(
@@ -214,7 +230,13 @@ async def _execute_chat(
             "routing_started",
             sessionId=session_id,
             requestId=req.request_id,
-            payload={"mode": routing_mode.value, "reason": decision.get("reason")},
+            payload={
+                "mode": routing_mode.value,
+                "reason": decision.get("reason"),
+                "confidence": decision.get("confidence"),
+                "continuation": decision.get("continuation"),
+                "requestedAgents": decision.get("requestedAgents"),
+            },
         )
     )
     await state.connections.broadcast(
