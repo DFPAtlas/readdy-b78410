@@ -39,6 +39,7 @@ from .garageflow_workflow import GarageFlowCallWorkflow
 from .garageflow_turns import GarageFlowTurnExecutor
 from .master_agent import MasterVoiceAgent
 from .website_registry import WebsiteRegistry
+from .telephony import TelephonyAuth, TelephonyRegistry, transfer_number
 from .models import (
     ChatRequest,
     MuteRequest,
@@ -80,6 +81,8 @@ class AppContext:
         self.websites = WebsiteRegistry([self.garageflow])
         self.garageflow_calls = GarageFlowCallWorkflow(self.sessions, self.garageflow)
         self.garageflow_turns = GarageFlowTurnExecutor(self.garageflow_calls)
+        self.telephony = TelephonyRegistry(self.garageflow_calls)
+        self.telephony_auth = TelephonyAuth()
         self.connections = ConnectionManager()
         self.stt = STTService(cfg)
         self.tts = TTSService(cfg)
@@ -817,6 +820,7 @@ async def root() -> dict:
             "/health", "/api/agents", "/api/status", "/api/chat",
             "/api/transcribe", "/api/voice", "/api/speech",
             "/api/workflows/garageflow/{sessionId}/audio-turn",
+            "/api/telephony/calls/start", "/api/telephony/calls/{callId}/audio-turn",
             "/api/speech/audio/{audioId}", "/ws",
         ],
     }
@@ -1000,6 +1004,155 @@ async def end_garageflow_call(session_id: str, request: Request) -> dict:
     state: AppContext = request.app.state.ctx
     state.garageflow_calls.end(session_id)
     return {"sessionId": session_id, "status": "ended"}
+
+
+def _require_telephony_auth(state: AppContext, request: Request) -> None:
+    if not state.telephony_auth.configured():
+        raise HTTPException(status_code=503, detail="telephony_not_configured")
+    supplied = request.headers.get("x-atlas-telephony-secret")
+    if not state.telephony_auth.verify(supplied):
+        raise HTTPException(status_code=401, detail="invalid_telephony_secret")
+
+
+@app.post("/api/telephony/calls/start")
+async def telephony_start_call(request: Request) -> dict:
+    """Provider webhook: create/map an inbound call to a GarageFlow voice session."""
+
+    state: AppContext = request.app.state.ctx
+    _require_telephony_auth(state, request)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    call_id = str(body.get("callId") or "").strip()
+    if not call_id:
+        raise HTTPException(status_code=400, detail="callId_required")
+
+    call = state.telephony.start(
+        call_id=call_id,
+        provider=str(body.get("provider") or "generic"),
+        caller_phone=str(body.get("callerPhone") or "").strip() or None,
+        called_number=str(body.get("calledNumber") or "").strip() or None,
+    )
+
+    identification = None
+    if call.caller_phone and state.garageflow.configured():
+        try:
+            identification = await state.garageflow_calls.identify_by_caller_phone(call.session_id)
+        except Exception:
+            logger.exception("Telephony caller lookup failed call=%s", call.call_id)
+            identification = {"status": "error", "code": "garageflow_lookup_failed"}
+
+    return {
+        **state.telephony.public(call),
+        "workflow": "garageflow_booking",
+        "identification": identification,
+        "state": state.garageflow_calls.public_state(call.session_id),
+        "nextAction": "collect_audio",
+    }
+
+
+@app.post("/api/telephony/calls/{call_id}/audio-turn")
+async def telephony_audio_turn(
+    call_id: str,
+    request: Request,
+    audio: UploadFile = File(...),
+    language: Optional[str] = Form(None),
+):
+    """Provider webhook: one caller audio turn in, one spoken reply resource out."""
+
+    state: AppContext = request.app.state.ctx
+    _require_telephony_auth(state, request)
+
+    call = state.telephony.get(call_id)
+    if call is None or call.status != "active":
+        raise HTTPException(status_code=404, detail="active_call_not_found")
+
+    try:
+        raw = await read_upload(audio, state.settings)
+    except AudioError as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"status": "error", "code": exc.code, "message": exc.message, "callId": call_id},
+        )
+
+    status_code, body = await _garageflow_audio_turn(
+        state,
+        session_id=call.session_id,
+        raw_audio=raw,
+        content_type=audio.content_type,
+        filename=audio.filename,
+        language=language,
+        speak=True,
+    )
+
+    if status_code != 200:
+        return JSONResponse(status_code=status_code, content={**body, "callId": call_id})
+
+    stage = ((body.get("state") or {}).get("stage") or "")
+    next_action = "collect_audio"
+    if stage == "complete":
+        next_action = "hangup"
+    elif stage == "escalate":
+        next_action = "transfer" if transfer_number() else "callback_required"
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            **body,
+            "callId": call_id,
+            "nextAction": next_action,
+            "transferAvailable": bool(transfer_number()),
+        },
+    )
+
+
+@app.post("/api/telephony/calls/{call_id}/transfer")
+async def telephony_transfer_call(call_id: str, request: Request) -> dict:
+    """Provider webhook helper: return the configured human-transfer action."""
+
+    state: AppContext = request.app.state.ctx
+    _require_telephony_auth(state, request)
+
+    call = state.telephony.get(call_id)
+    if call is None or call.status != "active":
+        raise HTTPException(status_code=404, detail="active_call_not_found")
+
+    target = transfer_number()
+    if not target:
+        return {
+            "callId": call_id,
+            "sessionId": call.session_id,
+            "action": "callback_required",
+            "reason": "transfer_number_not_configured",
+        }
+
+    current = state.garageflow_calls.get(call.session_id)
+    if current is not None and current.stage.value != "escalate":
+        state.garageflow_calls.controller.escalate(current, "human_transfer")
+
+    return {
+        "callId": call_id,
+        "sessionId": call.session_id,
+        "action": "transfer",
+        "target": target,
+    }
+
+
+@app.post("/api/telephony/calls/{call_id}/end")
+async def telephony_end_call(call_id: str, request: Request) -> dict:
+    """Provider webhook: end a call and clear its active workflow state."""
+
+    state: AppContext = request.app.state.ctx
+    _require_telephony_auth(state, request)
+    try:
+        call = state.telephony.end(call_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    return {**state.telephony.public(call), "action": "ended"}
 
 
 @app.get("/api/status")
