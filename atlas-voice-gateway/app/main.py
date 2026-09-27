@@ -34,6 +34,12 @@ from .audio import AudioError, read_upload, prepare_audio
 from .audio_store import AudioStore
 from .config import Settings, load_settings
 from .events import event
+from .garageflow_connector import GarageFlowConnector
+from .garageflow_workflow import GarageFlowCallWorkflow
+from .garageflow_turns import GarageFlowTurnExecutor
+from .master_agent import MasterVoiceAgent
+from .website_registry import WebsiteRegistry
+from .telephony import TelephonyAuth, TelephonyRegistry, transfer_number
 from .models import (
     ChatRequest,
     MuteRequest,
@@ -70,6 +76,13 @@ class AppContext:
         self.registry = AgentRegistry(cfg)
         self.sessions = SessionStore()
         self.router = AutoRouter()
+        self.master = MasterVoiceAgent()
+        self.garageflow = GarageFlowConnector()
+        self.websites = WebsiteRegistry([self.garageflow])
+        self.garageflow_calls = GarageFlowCallWorkflow(self.sessions, self.garageflow)
+        self.garageflow_turns = GarageFlowTurnExecutor(self.garageflow_calls)
+        self.telephony = TelephonyRegistry(self.garageflow_calls)
+        self.telephony_auth = TelephonyAuth()
         self.connections = ConnectionManager()
         self.stt = STTService(cfg)
         self.tts = TTSService(cfg)
@@ -123,7 +136,13 @@ def _iso(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
 
 
-def _resolve_route(state: AppContext, mode: RoutingMode, message: str, preferred_agent: Optional[str] = None) -> dict:
+def _resolve_route(
+    state: AppContext,
+    mode: RoutingMode,
+    message: str,
+    preferred_agent: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> dict:
     """Decide which agent should handle the request.
 
     Explicit HAL/TRON selections never silently switch agents: if the chosen
@@ -142,19 +161,29 @@ def _resolve_route(state: AppContext, mode: RoutingMode, message: str, preferred
             return {"agent": None, "error": "agent_unavailable", "message": "TRON is currently unavailable"}
         return {"agent": AGENT_TRON, "reason": "explicit", "intent": "engineering"}
 
-    # AUTO
+    # AUTO is owned by the Master Voice Agent. The current session agent is a
+    # continuity hint only; explicit HAL/TRON modes above remain authoritative.
     if not available:
         return {"agent": None, "error": "local_ai_unavailable", "message": "Local AI unavailable"}
 
-    if preferred_agent:
-        hint = preferred_agent.strip().lower()
-        if hint in ("atlas-hal", "hal") and AGENT_HAL in available:
-            return {"agent": AGENT_HAL, "reason": "preferred", "intent": "infrastructure"}
-        if hint in ("atlas-tron", "tron") and AGENT_TRON in available:
-            return {"agent": AGENT_TRON, "reason": "preferred", "intent": "engineering"}
+    current_agent = None
+    if session_id:
+        current_agent = state.sessions.touch_session(session_id).selected_agent
 
-    agent_id, reason, intent = state.router.pick(message, available)
-    return {"agent": agent_id, "reason": reason, "intent": intent}
+    decision = state.master.decide(
+        message,
+        available,
+        preferred_agent=preferred_agent,
+        current_agent=current_agent,
+    )
+    return {
+        "agent": decision.selected_agent,
+        "reason": decision.reason,
+        "intent": decision.intent,
+        "confidence": decision.confidence,
+        "continuation": decision.continuation,
+        "requestedAgents": list(decision.requested_agents),
+    }
 
 
 async def _execute_chat(
@@ -179,7 +208,7 @@ async def _execute_chat(
     if state.sessions.active_request_count() >= cfg.max_concurrent_total:
         return 429, {"status": "error", "code": "too_many_requests", "message": "Too many active requests."}
 
-    decision = _resolve_route(state, routing_mode, message, preferred_agent)
+    decision = _resolve_route(state, routing_mode, message, preferred_agent, session_id)
     if decision["agent"] is None:
         await state.connections.broadcast(
             event(
@@ -206,7 +235,13 @@ async def _execute_chat(
             "routing_started",
             sessionId=session_id,
             requestId=req.request_id,
-            payload={"mode": routing_mode.value, "reason": decision.get("reason")},
+            payload={
+                "mode": routing_mode.value,
+                "reason": decision.get("reason"),
+                "confidence": decision.get("confidence"),
+                "continuation": decision.get("continuation"),
+                "requestedAgents": decision.get("requestedAgents"),
+            },
         )
     )
     await state.connections.broadcast(
@@ -514,6 +549,151 @@ def _unknown_preferred_agent(preferred_agent: Optional[str]) -> Optional[str]:
     return candidate
 
 
+async def _garageflow_audio_turn(
+    state: AppContext,
+    *,
+    session_id: str,
+    raw_audio: bytes,
+    content_type: Optional[str],
+    filename: Optional[str],
+    language: Optional[str] = None,
+    speak: bool = True,
+) -> tuple[int, dict]:
+    """Run one GarageFlow telephone turn: audio -> STT -> workflow -> TTS.
+
+    This path deliberately bypasses HAL/TRON generation. The deterministic
+    GarageFlow workflow decides what happens; the speech engine only voices the
+    safe reply produced by that workflow.
+    """
+
+    if state.garageflow_calls.get(session_id) is None:
+        return 409, {
+            "status": "error",
+            "code": "garageflow_call_not_started",
+            "sessionId": session_id,
+        }
+
+    try:
+        prepared = await prepare_audio(raw_audio, content_type, filename, state.settings)
+    except AudioError as exc:
+        return exc.status_code, {
+            "status": "error",
+            "code": exc.code,
+            "message": exc.message,
+            "sessionId": session_id,
+        }
+
+    await state.connections.broadcast(
+        event(
+            "transcription_started",
+            sessionId=session_id,
+            payload={"model": state.stt.model, "device": state.stt.device, "workflow": "garageflow_booking"},
+        )
+    )
+
+    try:
+        stt_result = await state.stt.transcribe(prepared, session_id=session_id, language=language)
+    except STTError as exc:
+        if exc.code == "no_speech_detected":
+            return 200, {
+                "status": "no_speech_detected",
+                "sessionId": session_id,
+                "workflow": "garageflow_booking",
+                "transcript": "",
+            }
+        return exc.status_code, {
+            "status": "error",
+            "code": exc.code,
+            "message": exc.message,
+            "sessionId": session_id,
+        }
+
+    transcript = stt_result.transcript.strip()
+    await state.connections.broadcast(
+        event(
+            "transcript_final",
+            sessionId=session_id,
+            payload={
+                "transcript": transcript,
+                "language": stt_result.language,
+                "duration": stt_result.duration_s,
+                "processingTime": stt_result.processing_ms,
+                "workflow": "garageflow_booking",
+            },
+        )
+    )
+
+    try:
+        turn = await state.garageflow_turns.handle(session_id, transcript)
+    except ValueError as exc:
+        return 409, {
+            "status": "error",
+            "code": str(exc),
+            "sessionId": session_id,
+            "transcript": transcript,
+        }
+    except RuntimeError as exc:
+        logger.warning("GarageFlow audio workflow runtime error session=%s code=%s", session_id, exc)
+        return 503, {
+            "status": "error",
+            "code": str(exc),
+            "sessionId": session_id,
+            "transcript": transcript,
+        }
+
+    reply = str(turn.get("reply") or "").strip()
+    request_id = f"gf_{uuid.uuid4().hex[:12]}"
+    speech: dict = {"speechStatus": "skipped_disabled"}
+
+    if speak and reply:
+        try:
+            # Dedicated receptionist voice is a later configuration item.
+            # Reuse the current HAL Piper voice for V1 rather than inventing a
+            # voice identifier the TTS service does not support.
+            spoken = await _run_speech(state, AGENT_HAL, reply, session_id, request_id)
+            speech = {
+                "speechStatus": "synthesized",
+                "voiceId": spoken.get("voiceId"),
+                "audioRef": spoken.get("audioRef"),
+                "audioContentType": spoken.get("contentType"),
+                "speechDurationMs": spoken.get("durationMs"),
+            }
+        except TTSCancelled:
+            speech = {"speechStatus": "interrupted"}
+        except TTSError as exc:
+            logger.info("GarageFlow reply synthesis failed session=%s code=%s", session_id, exc.code)
+            speech = {"speechStatus": "failed", "speechError": exc.code}
+
+    await state.connections.broadcast(
+        event(
+            "activity",
+            sessionId=session_id,
+            requestId=request_id,
+            payload={
+                "type": "workflow",
+                "status": "complete" if turn.get("stage") in ("complete", "escalate") else "active",
+                "label": "GarageFlow telephone turn complete",
+                "website": "garageflow",
+                "stage": turn.get("stage"),
+                "action": turn.get("action"),
+            },
+        )
+    )
+
+    return 200, {
+        "status": "complete",
+        "sessionId": session_id,
+        "requestId": request_id,
+        "workflow": "garageflow_booking",
+        "transcript": transcript,
+        "language": stt_result.language,
+        "processingTime": stt_result.processing_ms,
+        "turn": turn,
+        "state": state.garageflow_calls.public_state(session_id),
+        **speech,
+    }
+
+
 # ---------------------------------------------------------------------- loops
 
 
@@ -639,6 +819,8 @@ async def root() -> dict:
         "endpoints": [
             "/health", "/api/agents", "/api/status", "/api/chat",
             "/api/transcribe", "/api/voice", "/api/speech",
+            "/api/workflows/garageflow/{sessionId}/audio-turn",
+            "/api/telephony/calls/start", "/api/telephony/calls/{callId}/audio-turn",
             "/api/speech/audio/{audioId}", "/ws",
         ],
     }
@@ -676,6 +858,303 @@ async def agents_endpoint(request: Request) -> dict:
     return {"agents": list(_agents_payload(state).values())}
 
 
+@app.get("/api/websites")
+async def websites_endpoint(request: Request) -> dict:
+    """Public-safe connected website capability catalogue."""
+
+    state: AppContext = request.app.state.ctx
+    return {"websites": state.websites.public_catalogue()}
+
+
+@app.post("/api/workflows/garageflow/{session_id}/start")
+async def start_garageflow_call(session_id: str, request: Request) -> dict:
+    """Attach GarageFlow telephone-booking state to an existing voice session."""
+
+    state: AppContext = request.app.state.ctx
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    caller_phone = str(body.get("callerPhone") or "").strip() or None
+    call_state = state.garageflow_calls.start(session_id, caller_phone)
+
+    identification = None
+    if caller_phone and state.garageflow.configured():
+        try:
+            identification = await state.garageflow_calls.identify_by_caller_phone(session_id)
+        except Exception:
+            logger.exception("GarageFlow caller lookup failed session=%s", session_id)
+            identification = {"status": "error", "code": "garageflow_lookup_failed"}
+
+    await state.connections.broadcast(
+        event(
+            "activity",
+            sessionId=session_id,
+            payload={
+                "type": "workflow",
+                "status": "active",
+                "label": "GarageFlow telephone booking started",
+                "website": "garageflow",
+                "stage": call_state.stage.value,
+            },
+        )
+    )
+    return {
+        "sessionId": session_id,
+        "workflow": "garageflow_booking",
+        "configured": state.garageflow.configured(),
+        "state": state.garageflow_calls.public_state(session_id),
+        "identification": identification,
+    }
+
+
+@app.get("/api/workflows/garageflow/{session_id}")
+async def garageflow_call_state(session_id: str, request: Request) -> dict:
+    state: AppContext = request.app.state.ctx
+    public = state.garageflow_calls.public_state(session_id)
+    if public is None:
+        raise HTTPException(status_code=404, detail="garageflow_call_not_started")
+    return {"sessionId": session_id, "workflow": "garageflow_booking", "state": public}
+
+
+@app.post("/api/workflows/garageflow/{session_id}/turn")
+async def garageflow_call_turn(session_id: str, request: Request) -> dict:
+    """Apply one final transcript to the GarageFlow booking state machine."""
+
+    state: AppContext = request.app.state.ctx
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    transcript = str(body.get("transcript") or "").strip()
+    if not transcript:
+        raise HTTPException(status_code=400, detail="transcript_required")
+
+    try:
+        result = await state.garageflow_turns.handle(session_id, transcript)
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=409,
+            content={"status": "error", "code": str(exc), "sessionId": session_id},
+        )
+    except RuntimeError as exc:
+        logger.warning("GarageFlow workflow runtime error session=%s code=%s", session_id, exc)
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "code": str(exc), "sessionId": session_id},
+        )
+
+    await state.connections.broadcast(
+        event(
+            "activity",
+            sessionId=session_id,
+            payload={
+                "type": "workflow",
+                "status": "active" if result.get("stage") not in ("complete", "escalate") else "complete",
+                "label": "GarageFlow call advanced",
+                "website": "garageflow",
+                "stage": result.get("stage"),
+                "action": result.get("action"),
+            },
+        )
+    )
+
+    return {
+        "sessionId": session_id,
+        "workflow": "garageflow_booking",
+        "turn": result,
+        "state": state.garageflow_calls.public_state(session_id),
+    }
+
+
+@app.post("/api/workflows/garageflow/{session_id}/audio-turn")
+async def garageflow_audio_turn(
+    session_id: str,
+    request: Request,
+    audio: UploadFile = File(...),
+    language: Optional[str] = Form(None),
+    speak: Optional[str] = Form("true"),
+):
+    """Complete one caller audio turn: STT -> GarageFlow state -> spoken reply."""
+
+    state: AppContext = request.app.state.ctx
+    try:
+        raw = await read_upload(audio, state.settings)
+    except AudioError as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"status": "error", "code": exc.code, "message": exc.message, "sessionId": session_id},
+        )
+
+    status_code, body = await _garageflow_audio_turn(
+        state,
+        session_id=session_id,
+        raw_audio=raw,
+        content_type=audio.content_type,
+        filename=audio.filename,
+        language=language,
+        speak=_parse_speak_flag(speak) is not False,
+    )
+    return JSONResponse(status_code=status_code, content=body)
+
+
+@app.delete("/api/workflows/garageflow/{session_id}")
+async def end_garageflow_call(session_id: str, request: Request) -> dict:
+    state: AppContext = request.app.state.ctx
+    state.garageflow_calls.end(session_id)
+    return {"sessionId": session_id, "status": "ended"}
+
+
+def _require_telephony_auth(state: AppContext, request: Request) -> None:
+    if not state.telephony_auth.configured():
+        raise HTTPException(status_code=503, detail="telephony_not_configured")
+    supplied = request.headers.get("x-atlas-telephony-secret")
+    if not state.telephony_auth.verify(supplied):
+        raise HTTPException(status_code=401, detail="invalid_telephony_secret")
+
+
+@app.post("/api/telephony/calls/start")
+async def telephony_start_call(request: Request) -> dict:
+    """Provider webhook: create/map an inbound call to a GarageFlow voice session."""
+
+    state: AppContext = request.app.state.ctx
+    _require_telephony_auth(state, request)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    call_id = str(body.get("callId") or "").strip()
+    if not call_id:
+        raise HTTPException(status_code=400, detail="callId_required")
+
+    call = state.telephony.start(
+        call_id=call_id,
+        provider=str(body.get("provider") or "generic"),
+        caller_phone=str(body.get("callerPhone") or "").strip() or None,
+        called_number=str(body.get("calledNumber") or "").strip() or None,
+    )
+
+    identification = None
+    if call.caller_phone and state.garageflow.configured():
+        try:
+            identification = await state.garageflow_calls.identify_by_caller_phone(call.session_id)
+        except Exception:
+            logger.exception("Telephony caller lookup failed call=%s", call.call_id)
+            identification = {"status": "error", "code": "garageflow_lookup_failed"}
+
+    return {
+        **state.telephony.public(call),
+        "workflow": "garageflow_booking",
+        "identification": identification,
+        "state": state.garageflow_calls.public_state(call.session_id),
+        "nextAction": "collect_audio",
+    }
+
+
+@app.post("/api/telephony/calls/{call_id}/audio-turn")
+async def telephony_audio_turn(
+    call_id: str,
+    request: Request,
+    audio: UploadFile = File(...),
+    language: Optional[str] = Form(None),
+):
+    """Provider webhook: one caller audio turn in, one spoken reply resource out."""
+
+    state: AppContext = request.app.state.ctx
+    _require_telephony_auth(state, request)
+
+    call = state.telephony.get(call_id)
+    if call is None or call.status != "active":
+        raise HTTPException(status_code=404, detail="active_call_not_found")
+
+    try:
+        raw = await read_upload(audio, state.settings)
+    except AudioError as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"status": "error", "code": exc.code, "message": exc.message, "callId": call_id},
+        )
+
+    status_code, body = await _garageflow_audio_turn(
+        state,
+        session_id=call.session_id,
+        raw_audio=raw,
+        content_type=audio.content_type,
+        filename=audio.filename,
+        language=language,
+        speak=True,
+    )
+
+    if status_code != 200:
+        return JSONResponse(status_code=status_code, content={**body, "callId": call_id})
+
+    stage = ((body.get("state") or {}).get("stage") or "")
+    next_action = "collect_audio"
+    if stage == "complete":
+        next_action = "hangup"
+    elif stage == "escalate":
+        next_action = "transfer" if transfer_number() else "callback_required"
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            **body,
+            "callId": call_id,
+            "nextAction": next_action,
+            "transferAvailable": bool(transfer_number()),
+        },
+    )
+
+
+@app.post("/api/telephony/calls/{call_id}/transfer")
+async def telephony_transfer_call(call_id: str, request: Request) -> dict:
+    """Provider webhook helper: return the configured human-transfer action."""
+
+    state: AppContext = request.app.state.ctx
+    _require_telephony_auth(state, request)
+
+    call = state.telephony.get(call_id)
+    if call is None or call.status != "active":
+        raise HTTPException(status_code=404, detail="active_call_not_found")
+
+    target = transfer_number()
+    if not target:
+        return {
+            "callId": call_id,
+            "sessionId": call.session_id,
+            "action": "callback_required",
+            "reason": "transfer_number_not_configured",
+        }
+
+    current = state.garageflow_calls.get(call.session_id)
+    if current is not None and current.stage.value != "escalate":
+        state.garageflow_calls.controller.escalate(current, "human_transfer")
+
+    return {
+        "callId": call_id,
+        "sessionId": call.session_id,
+        "action": "transfer",
+        "target": target,
+    }
+
+
+@app.post("/api/telephony/calls/{call_id}/end")
+async def telephony_end_call(call_id: str, request: Request) -> dict:
+    """Provider webhook: end a call and clear its active workflow state."""
+
+    state: AppContext = request.app.state.ctx
+    _require_telephony_auth(state, request)
+    try:
+        call = state.telephony.end(call_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    return {**state.telephony.public(call), "action": "ended"}
+
+
 @app.get("/api/status")
 async def status_endpoint(request: Request) -> dict:
     state: AppContext = request.app.state.ctx
@@ -690,6 +1169,7 @@ async def status_endpoint(request: Request) -> dict:
         "speechAudioResources": state.audio_store.count,
         "speechAudioBytes": state.audio_store.byte_size,
         "agents": _agents_payload(state),
+        "websites": state.websites.public_catalogue(),
     }
 
 
